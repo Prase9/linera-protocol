@@ -209,7 +209,8 @@ where
                         Ok(Some(RpcMessage::ChainInfoResponse(Box::new(info))))
                     }
                     Err(error) => {
-                        warn!(nickname = self.server.state.nickname(), %error, "Failed to handle block proposal");
+                        let nickname = self.server.state.nickname();
+                        warn!(nickname, %error, "Failed to handle block proposal");
                         Err(error.into())
                     }
                 }
@@ -219,11 +220,12 @@ where
                     .wait_for_outgoing_messages
                     .then(oneshot::channel)
                     .unzip();
-                match self
-                    .server
-                    .state
-                    .handle_lite_certificate(request.certificate, sender)
-                    .await
+                match Box::pin(
+                    self.server
+                        .state
+                        .handle_lite_certificate(request.certificate, sender),
+                )
+                .await
                 {
                     Ok((info, actions)) => {
                         // Cross-shard requests
@@ -237,10 +239,11 @@ where
                         Ok(Some(RpcMessage::ChainInfoResponse(Box::new(info))))
                     }
                     Err(error) => {
+                        let nickname = self.server.state.nickname();
                         if let WorkerError::MissingCertificateValue = &error {
-                            debug!(nickname = self.server.state.nickname(), %error, "Failed to handle lite certificate");
+                            debug!(nickname, %error, "Failed to handle lite certificate");
                         } else {
-                            error!(nickname = self.server.state.nickname(), %error, "Failed to handle lite certificate");
+                            error!(nickname, %error, "Failed to handle lite certificate");
                         }
                         Err(error.into())
                     }
@@ -260,7 +263,8 @@ where
                         Ok(Some(RpcMessage::ChainInfoResponse(Box::new(info))))
                     }
                     Err(error) => {
-                        error!(nickname = self.server.state.nickname(), %error, "Failed to handle timeout certificate");
+                        let nickname = self.server.state.nickname();
+                        error!(nickname, %error, "Failed to handle timeout certificate");
                         Err(error.into())
                     }
                 }
@@ -310,7 +314,8 @@ where
                         Ok(Some(RpcMessage::ChainInfoResponse(Box::new(info))))
                     }
                     Err(error) => {
-                        error!(nickname = self.server.state.nickname(), %error, "Failed to handle confirmed certificate");
+                        let nickname = self.server.state.nickname();
+                        error!(nickname, %error, "Failed to handle confirmed certificate");
                         Err(error.into())
                     }
                 }
@@ -324,7 +329,8 @@ where
                         Ok(Some(RpcMessage::ChainInfoResponse(Box::new(info))))
                     }
                     Err(error) => {
-                        error!(nickname = self.server.state.nickname(), %error, "Failed to handle chain info query");
+                        let nickname = self.server.state.nickname();
+                        error!(nickname, %error, "Failed to handle chain info query");
                         Err(error.into())
                     }
                 }
@@ -385,8 +391,8 @@ where
             | RpcMessage::Error(_)
             | RpcMessage::ChainInfoResponse(_)
             | RpcMessage::VersionInfoResponse(_)
-            | RpcMessage::GenesisConfigHashQuery
-            | RpcMessage::GenesisConfigHashResponse(_)
+            | RpcMessage::NetworkDescriptionQuery
+            | RpcMessage::NetworkDescriptionResponse(_)
             | RpcMessage::DownloadBlob(_)
             | RpcMessage::DownloadBlobResponse(_)
             | RpcMessage::DownloadPendingBlobResponse(_)

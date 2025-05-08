@@ -6,7 +6,7 @@ use std::{
     path::Path,
 };
 
-use fs4::FileExt as _;
+use fs4::FileExt;
 use thiserror_context::Context;
 
 use super::{Dirty, Persist};
@@ -69,7 +69,7 @@ impl Lock {
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        if let Err(error) = self.0.file().unlock() {
+        if let Err(error) = FileExt::unlock(self.0.file()) {
             tracing::warn!("Failed to unlock wallet file: {error}");
         }
     }
@@ -78,7 +78,7 @@ impl Drop for Lock {
 /// An implementation of [`Persist`] based on an atomically-updated file at a given path.
 /// An exclusive lock is taken using `flock(2)` to ensure that concurrent updates cannot
 /// happen, and writes are saved to a staging file before being moved over the old file,
-/// an operation that is atomic on all UNIXes.
+/// an operation that is atomic on all Unixes.
 pub struct File<T> {
     _lock: Lock,
     path: std::path::PathBuf,
@@ -136,7 +136,7 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned> File<T> {
         Self::read_or_create(path, || {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("path does not exist: {}", path.display()),
+                format!("file is empty or does not exist: {}", path.display()),
             )
             .into())
         })

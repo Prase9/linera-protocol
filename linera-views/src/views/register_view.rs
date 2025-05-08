@@ -4,11 +4,12 @@
 #[cfg(with_metrics)]
 use std::sync::LazyLock;
 
-use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
 #[cfg(with_metrics)]
 use {
-    linera_base::prometheus_util::{bucket_latencies, register_histogram_vec, MeasureLatency},
+    linera_base::prometheus_util::{
+        exponential_bucket_latencies, register_histogram_vec, MeasureLatency,
+    },
     prometheus::HistogramVec,
 };
 
@@ -17,6 +18,7 @@ use crate::{
     common::{from_bytes_option_or_default, HasherOutput},
     context::Context,
     hashable_wrapper::WrappedHashableContainerView,
+    store::ReadableKeyValueStore as _,
     views::{ClonableView, HashableView, Hasher, View, ViewError},
 };
 
@@ -27,7 +29,7 @@ static REGISTER_VIEW_HASH_RUNTIME: LazyLock<HistogramVec> = LazyLock::new(|| {
         "register_view_hash_runtime",
         "RegisterView hash runtime",
         &[],
-        bucket_latencies(5.0),
+        exponential_bucket_latencies(5.0),
     )
 });
 
@@ -40,7 +42,6 @@ pub struct RegisterView<C, T> {
     update: Option<Box<T>>,
 }
 
-#[async_trait]
 impl<C, T> View<C> for RegisterView<C, T>
 where
     C: Context + Send + Sync,
@@ -54,7 +55,7 @@ where
     }
 
     fn pre_load(context: &C) -> Result<Vec<Vec<u8>>, ViewError> {
-        Ok(vec![context.base_key()])
+        Ok(vec![context.base_key().bytes.clone()])
     }
 
     fn post_load(context: C, values: &[Option<Vec<u8>>]) -> Result<Self, ViewError> {
@@ -71,7 +72,7 @@ where
 
     async fn load(context: C) -> Result<Self, ViewError> {
         let keys = Self::pre_load(&context)?;
-        let values = context.read_multi_values_bytes(keys).await?;
+        let values = context.store().read_multi_values_bytes(keys).await?;
         Self::post_load(context, &values)
     }
 
@@ -90,11 +91,11 @@ where
     fn flush(&mut self, batch: &mut Batch) -> Result<bool, ViewError> {
         let mut delete_view = false;
         if self.delete_storage_first {
-            batch.delete_key(self.context.base_key());
+            batch.delete_key(self.context.base_key().bytes.clone());
             self.stored_value = Box::default();
             delete_view = true;
         } else if let Some(value) = self.update.take() {
-            let key = self.context.base_key();
+            let key = self.context.base_key().bytes.clone();
             batch.put_key_value(key, &value)?;
             self.stored_value = value;
         }
@@ -132,10 +133,10 @@ where
     /// Access the current value in the register.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut register = RegisterView::<_, u32>::load(context).await.unwrap();
     /// let value = register.get();
     /// assert_eq!(*value, 0);
@@ -151,10 +152,10 @@ where
     /// Sets the value in the register.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut register = RegisterView::load(context).await.unwrap();
     /// register.set(5);
     /// let value = register.get();
@@ -180,10 +181,10 @@ where
     /// Obtains a mutable reference to the value in the register.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut register: RegisterView<_, u32> = RegisterView::load(context).await.unwrap();
     /// let value = register.get_mut();
     /// assert_eq!(*value, 0);
@@ -209,7 +210,6 @@ where
     }
 }
 
-#[async_trait]
 impl<C, T> HashableView<C> for RegisterView<C, T>
 where
     C: Context + Send + Sync,

@@ -9,23 +9,21 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use linera_base::{
     crypto::CryptoHash,
-    data_types::{Blob, TimeDelta, Timestamp},
-    hashed::Hashed,
-    identifiers::{BlobId, ChainId, UserApplicationId},
+    data_types::{Blob, Epoch, TimeDelta, Timestamp},
+    identifiers::{ApplicationId, BlobId, ChainId, EventId},
 };
 use linera_chain::{
-    types::{ConfirmedBlock, ConfirmedBlockCertificate, LiteCertificate},
+    types::{CertificateValue, ConfirmedBlock, ConfirmedBlockCertificate, LiteCertificate},
     ChainStateView,
 };
 use linera_execution::{
-    committee::Epoch, BlobState, ExecutionRuntimeConfig, UserContractCode, UserServiceCode,
-    WasmRuntime,
+    BlobState, ExecutionRuntimeConfig, UserContractCode, UserServiceCode, WasmRuntime,
 };
 use linera_views::{
     backends::dual::{DualStoreRootKeyAssignment, StoreInUse},
     batch::Batch,
     context::ViewContext,
-    store::KeyValueStore,
+    store::{AdminKeyValueStore, KeyIterable as _, KeyValueStore},
     views::{View, ViewError},
 };
 use serde::{Deserialize, Serialize};
@@ -38,12 +36,13 @@ use {
 #[cfg(with_metrics)]
 use {
     linera_base::prometheus_util::{
-        bucket_latencies, register_histogram_vec, register_int_counter_vec, MeasureLatency,
+        exponential_bucket_latencies, register_histogram_vec, register_int_counter_vec,
+        MeasureLatency,
     },
     prometheus::{HistogramVec, IntCounterVec},
 };
 
-use crate::{ChainRuntimeContext, Clock, Storage};
+use crate::{ChainRuntimeContext, Clock, NetworkDescription, Storage};
 
 /// The metric counting how often a blob is tested for existence from storage
 #[cfg(with_metrics)]
@@ -88,9 +87,9 @@ static CONTAINS_CERTIFICATE_COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| 
 /// The metric counting how often a hashed certificate value is read from storage.
 #[cfg(with_metrics)]
 #[doc(hidden)]
-pub static READ_HASHED_CONFIRMED_BLOCK_COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
+pub static READ_CONFIRMED_BLOCK_COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec(
-        "read_hashed_confirmed_block",
+        "read_confirmed_block",
         "The metric counting how often a hashed confirmed block is read from storage",
         &[],
     )
@@ -181,7 +180,61 @@ pub static LOAD_CHAIN_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
         "load_chain_latency",
         "The latency to load a chain state",
         &[],
-        bucket_latencies(1.0),
+        exponential_bucket_latencies(10.0),
+    )
+});
+
+/// The metric counting how often an event is read from storage.
+#[cfg(with_metrics)]
+#[doc(hidden)]
+pub static READ_EVENT_COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec(
+        "read_event",
+        "The metric counting how often an event is read from storage",
+        &[],
+    )
+});
+
+/// The metric counting how often an event is tested for existence from storage
+#[cfg(with_metrics)]
+static CONTAINS_EVENT_COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec(
+        "contains_event",
+        "The metric counting how often an event is tested for existence from storage",
+        &[],
+    )
+});
+
+/// The metric counting how often an event is written to storage.
+#[cfg(with_metrics)]
+#[doc(hidden)]
+pub static WRITE_EVENT_COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec(
+        "write_event",
+        "The metric counting how often an event is written to storage",
+        &[],
+    )
+});
+
+/// The metric counting how often the network description is read from storage.
+#[cfg(with_metrics)]
+#[doc(hidden)]
+pub static READ_NETWORK_DESCRIPTION: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec(
+        "network_description",
+        "The metric counting how often the network description is read from storage",
+        &[],
+    )
+});
+
+/// The metric counting how often the network description is written to storage.
+#[cfg(with_metrics)]
+#[doc(hidden)]
+pub static WRITE_NETWORK_DESCRIPTION: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec(
+        "write_event",
+        "The metric counting how often the network description is written to storage",
+        &[],
     )
 });
 
@@ -192,6 +245,13 @@ trait BatchExt {
 
     fn add_certificate(&mut self, certificate: &ConfirmedBlockCertificate)
         -> Result<(), ViewError>;
+
+    fn add_event(&mut self, event_id: EventId, value: Vec<u8>) -> Result<(), ViewError>;
+
+    fn add_network_description(
+        &mut self,
+        information: &NetworkDescription,
+    ) -> Result<(), ViewError>;
 }
 
 impl BatchExt for Batch {
@@ -199,7 +259,7 @@ impl BatchExt for Batch {
         #[cfg(with_metrics)]
         WRITE_BLOB_COUNTER.with_label_values(&[]).inc();
         let blob_key = bcs::to_bytes(&BaseKey::Blob(blob.id()))?;
-        self.put_key_value(blob_key.to_vec(), &blob.bytes())?;
+        self.put_key_value_bytes(blob_key.to_vec(), blob.bytes().to_vec());
         Ok(())
     }
 
@@ -217,21 +277,40 @@ impl BatchExt for Batch {
         WRITE_CERTIFICATE_COUNTER.with_label_values(&[]).inc();
         let hash = certificate.hash();
         let cert_key = bcs::to_bytes(&BaseKey::Certificate(hash))?;
-        let value_key = bcs::to_bytes(&BaseKey::ConfirmedBlock(hash))?;
+        let block_key = bcs::to_bytes(&BaseKey::ConfirmedBlock(hash))?;
         self.put_key_value(cert_key.to_vec(), &certificate.lite_certificate())?;
-        self.put_key_value(value_key.to_vec(), certificate.value())?;
+        self.put_key_value(block_key.to_vec(), certificate.value())?;
+        Ok(())
+    }
+
+    fn add_event(&mut self, event_id: EventId, value: Vec<u8>) -> Result<(), ViewError> {
+        #[cfg(with_metrics)]
+        WRITE_EVENT_COUNTER.with_label_values(&[]).inc();
+        let event_key = bcs::to_bytes(&BaseKey::Event(event_id))?;
+        self.put_key_value_bytes(event_key.to_vec(), value);
+        Ok(())
+    }
+
+    fn add_network_description(
+        &mut self,
+        information: &NetworkDescription,
+    ) -> Result<(), ViewError> {
+        #[cfg(with_metrics)]
+        WRITE_NETWORK_DESCRIPTION.with_label_values(&[]).inc();
+        let key = bcs::to_bytes(&BaseKey::NetworkDescription)?;
+        self.put_key_value(key, information)?;
         Ok(())
     }
 }
 
 /// Main implementation of the [`Storage`] trait.
 #[derive(Clone)]
-pub struct DbStorage<Store, Clock> {
+pub struct DbStorage<Store, Clock = WallClock> {
     store: Arc<Store>,
     clock: Clock,
     wasm_runtime: Option<WasmRuntime>,
-    user_contracts: Arc<DashMap<UserApplicationId, UserContractCode>>,
-    user_services: Arc<DashMap<UserApplicationId, UserServiceCode>>,
+    user_contracts: Arc<DashMap<ApplicationId, UserContractCode>>,
+    user_services: Arc<DashMap<ApplicationId, UserServiceCode>>,
     execution_runtime_config: ExecutionRuntimeConfig,
 }
 
@@ -242,14 +321,59 @@ enum BaseKey {
     ConfirmedBlock(CryptoHash),
     Blob(BlobId),
     BlobState(BlobId),
+    Event(EventId),
+    BlockExporterState(u32),
+    NetworkDescription,
+}
+
+const INDEX_CHAIN_ID: u8 = 0;
+const INDEX_BLOB_ID: u8 = 3;
+const CHAIN_ID_LENGTH: usize = std::mem::size_of::<ChainId>();
+const BLOB_ID_LENGTH: usize = std::mem::size_of::<BlobId>();
+
+#[cfg(test)]
+mod tests {
+    use linera_base::{
+        crypto::CryptoHash,
+        identifiers::{BlobId, BlobType, ChainId},
+    };
+
+    use crate::db_storage::{
+        BaseKey, BLOB_ID_LENGTH, CHAIN_ID_LENGTH, INDEX_BLOB_ID, INDEX_CHAIN_ID,
+    };
+
+    #[test]
+    fn test_base_key_serialization() {
+        let hash = CryptoHash::default();
+        let blob_type = BlobType::default();
+        let blob_id = BlobId::new(hash, blob_type);
+        let base_key = BaseKey::Blob(blob_id);
+        let key = bcs::to_bytes(&base_key).expect("a key");
+        assert_eq!(key[0], INDEX_BLOB_ID);
+        assert_eq!(key.len(), 1 + BLOB_ID_LENGTH);
+    }
+
+    #[test]
+    fn test_chain_id_serialization() {
+        let hash = CryptoHash::default();
+        let chain_id = ChainId(hash);
+        let base_key = BaseKey::ChainState(chain_id);
+        let key = bcs::to_bytes(&base_key).expect("a key");
+        assert_eq!(key[0], INDEX_CHAIN_ID);
+        assert_eq!(key.len(), 1 + CHAIN_ID_LENGTH);
+    }
 }
 
 /// An implementation of [`DualStoreRootKeyAssignment`] that stores the
 /// chain states into the first store.
+#[derive(Clone, Copy)]
 pub struct ChainStatesFirstAssignment;
 
 impl DualStoreRootKeyAssignment for ChainStatesFirstAssignment {
     fn assigned_store(root_key: &[u8]) -> Result<StoreInUse, bcs::Error> {
+        if root_key.is_empty() {
+            return Ok(StoreInUse::Second);
+        }
         let store = match bcs::from_bytes(root_key)? {
             BaseKey::ChainState(_) => StoreInUse::First,
             _ => StoreInUse::Second,
@@ -380,6 +504,7 @@ where
 {
     type Context = ViewContext<ChainRuntimeContext<Self>, Store>;
     type Clock = C;
+    type BlockExporterContext = ViewContext<u32, Store>;
 
     fn clock(&self) -> &C {
         &self.clock
@@ -438,23 +563,18 @@ where
         Ok(test)
     }
 
-    async fn read_hashed_confirmed_block(
-        &self,
-        hash: CryptoHash,
-    ) -> Result<Hashed<ConfirmedBlock>, ViewError> {
-        let value_key = bcs::to_bytes(&BaseKey::ConfirmedBlock(hash))?;
-        let maybe_value = self.store.read_value::<ConfirmedBlock>(&value_key).await?;
+    async fn read_confirmed_block(&self, hash: CryptoHash) -> Result<ConfirmedBlock, ViewError> {
+        let block_key = bcs::to_bytes(&BaseKey::ConfirmedBlock(hash))?;
+        let maybe_value = self.store.read_value::<ConfirmedBlock>(&block_key).await?;
         #[cfg(with_metrics)]
-        READ_HASHED_CONFIRMED_BLOCK_COUNTER
-            .with_label_values(&[])
-            .inc();
+        READ_CONFIRMED_BLOCK_COUNTER.with_label_values(&[]).inc();
         let value = maybe_value.ok_or_else(|| ViewError::not_found("value for hash", hash))?;
-        Ok(value.with_hash_unchecked(hash))
+        Ok(value)
     }
 
     async fn read_blob(&self, blob_id: BlobId) -> Result<Blob, ViewError> {
         let blob_key = bcs::to_bytes(&BaseKey::Blob(blob_id))?;
-        let maybe_blob_bytes = self.store.read_value::<Vec<u8>>(&blob_key).await?;
+        let maybe_blob_bytes = self.store.read_value_bytes(&blob_key).await?;
         #[cfg(with_metrics)]
         READ_BLOB_COUNTER.with_label_values(&[]).inc();
         let blob_bytes = maybe_blob_bytes.ok_or_else(|| ViewError::BlobsNotFound(vec![blob_id]))?;
@@ -469,7 +589,7 @@ where
             .iter()
             .map(|blob_id| bcs::to_bytes(&BaseKey::Blob(*blob_id)))
             .collect::<Result<Vec<_>, _>>()?;
-        let maybe_blob_bytes = self.store.read_multi_values::<Vec<u8>>(blob_keys).await?;
+        let maybe_blob_bytes = self.store.read_multi_values_bytes(blob_keys).await?;
         #[cfg(with_metrics)]
         READ_BLOB_COUNTER
             .with_label_values(&[])
@@ -518,19 +638,19 @@ where
         Ok(blob_states)
     }
 
-    async fn read_hashed_confirmed_blocks_downward(
+    async fn read_confirmed_blocks_downward(
         &self,
         from: CryptoHash,
         limit: u32,
-    ) -> Result<Vec<Hashed<ConfirmedBlock>>, ViewError> {
+    ) -> Result<Vec<ConfirmedBlock>, ViewError> {
         let mut hash = Some(from);
         let mut values = Vec::new();
         for _ in 0..limit {
             let Some(next_hash) = hash else {
                 break;
             };
-            let value = self.read_hashed_confirmed_block(next_hash).await?;
-            hash = value.inner().block().header.previous_block_hash;
+            let value = self.read_confirmed_block(next_hash).await?;
+            hash = value.block().header.previous_block_hash;
             values.push(value);
         }
         Ok(values)
@@ -582,7 +702,7 @@ where
             .store
             .read_multi_values::<BlobState>(blob_state_keys)
             .await?;
-        let mut latest_epoches = Vec::new();
+        let mut latest_epochs = Vec::new();
         let mut batch = Batch::new();
         let mut need_write = false;
         for (maybe_blob_state, blob_id) in maybe_blob_states.iter().zip(blob_ids) {
@@ -597,12 +717,12 @@ where
                 batch.add_blob_state(*blob_id, &blob_state)?;
                 need_write = true;
             }
-            latest_epoches.push(latest_epoch);
+            latest_epochs.push(latest_epoch);
         }
         if need_write {
             self.write_batch(batch).await?;
         }
-        Ok(latest_epoches)
+        Ok(latest_epochs)
     }
 
     async fn write_blob_state(
@@ -704,8 +824,62 @@ where
         Ok(certificates)
     }
 
+    async fn read_event(&self, event_id: EventId) -> Result<Vec<u8>, ViewError> {
+        let event_key = bcs::to_bytes(&BaseKey::Event(event_id.clone()))?;
+        let maybe_value = self.store.read_value_bytes(&event_key).await?;
+        #[cfg(with_metrics)]
+        READ_EVENT_COUNTER.with_label_values(&[]).inc();
+        maybe_value.ok_or_else(|| ViewError::EventsNotFound(vec![event_id]))
+    }
+
+    async fn contains_event(&self, event_id: EventId) -> Result<bool, ViewError> {
+        let event_key = bcs::to_bytes(&BaseKey::Event(event_id))?;
+        let exists = self.store.contains_key(&event_key).await?;
+        #[cfg(with_metrics)]
+        CONTAINS_EVENT_COUNTER.with_label_values(&[]).inc();
+        Ok(exists)
+    }
+
+    async fn write_events(
+        &self,
+        events: impl IntoIterator<Item = (EventId, Vec<u8>)> + Send,
+    ) -> Result<(), ViewError> {
+        let mut batch = Batch::new();
+        for (event_id, value) in events {
+            batch.add_event(event_id, value)?;
+        }
+        self.write_batch(batch).await
+    }
+
+    async fn read_network_description(&self) -> Result<Option<NetworkDescription>, ViewError> {
+        let key = bcs::to_bytes(&BaseKey::NetworkDescription)?;
+        let maybe_value = self.store.read_value(&key).await?;
+        #[cfg(with_metrics)]
+        READ_NETWORK_DESCRIPTION.with_label_values(&[]).inc();
+        Ok(maybe_value)
+    }
+
+    async fn write_network_description(
+        &self,
+        information: &NetworkDescription,
+    ) -> Result<(), ViewError> {
+        let mut batch = Batch::new();
+        batch.add_network_description(information)?;
+        self.write_batch(batch).await?;
+        Ok(())
+    }
+
     fn wasm_runtime(&self) -> Option<WasmRuntime> {
         self.wasm_runtime
+    }
+
+    async fn block_exporter_context(
+        &self,
+        block_exporter_id: u32,
+    ) -> Result<Self::BlockExporterContext, ViewError> {
+        let root_key = bcs::to_bytes(&BaseKey::BlockExporterState(block_exporter_id))?;
+        let store = self.store.clone_with_root_key(&root_key)?;
+        Ok(ViewContext::create_root_context(store, block_exporter_id).await?)
     }
 }
 
@@ -720,8 +894,8 @@ where
             .iter()
             .flat_map(|hash| {
                 let cert_key = bcs::to_bytes(&BaseKey::Certificate(*hash));
-                let value_key = bcs::to_bytes(&BaseKey::ConfirmedBlock(*hash));
-                vec![cert_key, value_key]
+                let block_key = bcs::to_bytes(&BaseKey::ConfirmedBlock(*hash));
+                vec![cert_key, block_key]
             })
             .collect::<Result<_, _>>()?)
     }
@@ -738,8 +912,9 @@ where
             .ok_or_else(|| ViewError::not_found("value bytes for hash", hash))?;
         let cert = bcs::from_bytes::<LiteCertificate>(cert_bytes)?;
         let value = bcs::from_bytes::<ConfirmedBlock>(value_bytes)?;
+        assert_eq!(value.hash(), hash);
         let certificate = cert
-            .with_value(value.with_hash_unchecked(hash))
+            .with_value(value)
             .ok_or(ViewError::InconsistentEntries)?;
         Ok(certificate)
     }
@@ -749,7 +924,7 @@ where
         Ok(())
     }
 
-    fn create(store: Store, wasm_runtime: Option<WasmRuntime>, clock: C) -> Self {
+    fn new(store: Store, wasm_runtime: Option<WasmRuntime>, clock: C) -> Self {
         Self {
             store: Arc::new(store),
             clock,
@@ -766,24 +941,63 @@ where
     Store: KeyValueStore + Clone + Send + Sync + 'static,
     Store::Error: Send + Sync,
 {
-    pub async fn initialize(
-        config: Store::Config,
+    pub async fn maybe_create_and_connect(
+        config: &Store::Config,
         namespace: &str,
-        root_key: &[u8],
         wasm_runtime: Option<WasmRuntime>,
     ) -> Result<Self, Store::Error> {
-        let store = Store::maybe_create_and_connect(&config, namespace, root_key).await?;
-        Ok(Self::create(store, wasm_runtime, WallClock))
+        let store = Store::maybe_create_and_connect(config, namespace).await?;
+        Ok(Self::new(store, wasm_runtime, WallClock))
     }
 
-    pub async fn new(
-        config: Store::Config,
+    pub async fn connect(
+        config: &Store::Config,
         namespace: &str,
-        root_key: &[u8],
         wasm_runtime: Option<WasmRuntime>,
     ) -> Result<Self, Store::Error> {
-        let store = Store::connect(&config, namespace, root_key).await?;
-        Ok(Self::create(store, wasm_runtime, WallClock))
+        let store = Store::connect(config, namespace).await?;
+        Ok(Self::new(store, wasm_runtime, WallClock))
+    }
+
+    /// Lists the blob IDs of the storage.
+    pub async fn list_blob_ids(
+        config: &Store::Config,
+        namespace: &str,
+    ) -> Result<Vec<BlobId>, ViewError> {
+        let store = Store::maybe_create_and_connect(config, namespace).await?;
+        let prefix = &[INDEX_BLOB_ID];
+        let keys = store.find_keys_by_prefix(prefix).await?;
+        let mut blob_ids = Vec::new();
+        for key in keys.iterator() {
+            let key = key?;
+            let key_red = &key[..BLOB_ID_LENGTH];
+            let blob_id = bcs::from_bytes(key_red)?;
+            blob_ids.push(blob_id);
+        }
+        Ok(blob_ids)
+    }
+}
+
+impl<Store> DbStorage<Store, WallClock>
+where
+    Store: AdminKeyValueStore + Clone + Send + Sync + 'static,
+    Store::Error: Send + Sync,
+{
+    /// Lists the chain IDs of the storage.
+    pub async fn list_chain_ids(
+        config: &Store::Config,
+        namespace: &str,
+    ) -> Result<Vec<ChainId>, ViewError> {
+        let root_keys = Store::list_root_keys(config, namespace).await?;
+        let mut chain_ids = Vec::new();
+        for root_key in root_keys {
+            if root_key.len() == 1 + CHAIN_ID_LENGTH && root_key[0] == INDEX_CHAIN_ID {
+                let root_key_red = &root_key[1..1 + CHAIN_ID_LENGTH];
+                let chain_id = bcs::from_bytes(root_key_red)?;
+                chain_ids.push(chain_id);
+            }
+        }
+        Ok(chain_ids)
     }
 }
 
@@ -796,11 +1010,9 @@ where
     pub async fn make_test_storage(wasm_runtime: Option<WasmRuntime>) -> Self {
         let config = Store::new_test_config().await.unwrap();
         let namespace = generate_test_namespace();
-        let root_key = &[];
         DbStorage::<Store, TestClock>::new_for_testing(
             config,
             &namespace,
-            root_key,
             wasm_runtime,
             TestClock::new(),
         )
@@ -811,11 +1023,10 @@ where
     pub async fn new_for_testing(
         config: Store::Config,
         namespace: &str,
-        root_key: &[u8],
         wasm_runtime: Option<WasmRuntime>,
         clock: TestClock,
     ) -> Result<Self, Store::Error> {
-        let store = Store::recreate_and_connect(&config, namespace, root_key).await?;
-        Ok(Self::create(store, wasm_runtime, clock))
+        let store = Store::recreate_and_connect(&config, namespace).await?;
+        Ok(Self::new(store, wasm_runtime, clock))
     }
 }

@@ -8,24 +8,25 @@ mod temporary_changes;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    iter,
     sync::{self, Arc},
 };
 
 use linera_base::{
-    crypto::CryptoHash,
-    data_types::{Blob, BlockHeight, UserApplicationDescription},
+    crypto::{CryptoHash, ValidatorPublicKey},
+    data_types::{ApplicationDescription, Blob, BlockHeight, Epoch},
     ensure,
     hashed::Hashed,
-    identifiers::{BlobId, ChainId, UserApplicationId},
+    identifiers::{ApplicationId, BlobId, BlobType, ChainId},
 };
 use linera_chain::{
-    data_types::{BlockProposal, ExecutedBlock, Medium, MessageBundle, Origin, Proposal, Target},
+    data_types::{BlockExecutionOutcome, BlockProposal, MessageBundle, ProposedBlock},
+    manager,
     types::{Block, ConfirmedBlockCertificate, TimeoutCertificate, ValidatedBlockCertificate},
     ChainError, ChainStateView,
 };
 use linera_execution::{
-    committee::{Epoch, ValidatorName},
-    Message, Query, QueryContext, Response, ServiceRuntimeEndpoint, SystemMessage,
+    ExecutionStateView, Query, QueryContext, QueryOutcome, ServiceRuntimeEndpoint,
 };
 use linera_storage::{Clock as _, Storage};
 use linera_views::views::{ClonableView, ViewError};
@@ -55,6 +56,7 @@ where
     shared_chain_view: Option<Arc<RwLock<ChainStateView<StorageClient::Context>>>>,
     service_runtime_endpoint: Option<ServiceRuntimeEndpoint>,
     block_values: Arc<ValueCache<CryptoHash, Hashed<Block>>>,
+    execution_state_cache: Arc<ValueCache<CryptoHash, ExecutionStateView<StorageClient::Context>>>,
     tracked_chains: Option<Arc<sync::RwLock<HashSet<ChainId>>>>,
     delivery_notifier: DeliveryNotifier,
     knows_chain_is_active: bool,
@@ -65,11 +67,15 @@ where
     StorageClient: Storage + Clone + Send + Sync + 'static,
 {
     /// Creates a new [`ChainWorkerState`] using the provided `storage` client.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn load(
         config: ChainWorkerConfig,
         storage: StorageClient,
         block_values: Arc<ValueCache<CryptoHash, Hashed<Block>>>,
+
+        execution_state_cache: Arc<
+            ValueCache<CryptoHash, ExecutionStateView<StorageClient::Context>>,
+        >,
         tracked_chains: Option<Arc<sync::RwLock<HashSet<ChainId>>>>,
         delivery_notifier: DeliveryNotifier,
         chain_id: ChainId,
@@ -84,6 +90,7 @@ where
             shared_chain_view: None,
             service_runtime_endpoint,
             block_values,
+            execution_state_cache,
             tracked_chains,
             delivery_notifier,
             knows_chain_is_active: false,
@@ -140,7 +147,7 @@ where
     #[cfg(with_testing)]
     pub(super) async fn find_bundle_in_inbox(
         &mut self,
-        inbox_id: Origin,
+        inbox_id: ChainId,
         certificate_hash: CryptoHash,
         height: BlockHeight,
         index: u32,
@@ -155,7 +162,7 @@ where
     pub(super) async fn query_application(
         &mut self,
         query: Query,
-    ) -> Result<Response, WorkerError> {
+    ) -> Result<QueryOutcome, WorkerError> {
         ChainWorkerStateWithTemporaryChanges::new(self)
             .await
             .query_application(query)
@@ -165,8 +172,8 @@ where
     /// Returns an application's description.
     pub(super) async fn describe_application(
         &mut self,
-        application_id: UserApplicationId,
-    ) -> Result<UserApplicationDescription, WorkerError> {
+        application_id: ApplicationId,
+    ) -> Result<ApplicationDescription, WorkerError> {
         ChainWorkerStateWithTemporaryChanges::new(self)
             .await
             .describe_application(application_id)
@@ -176,12 +183,15 @@ where
     /// Executes a block without persisting any changes to the state.
     pub(super) async fn stage_block_execution(
         &mut self,
-        block: Proposal,
-    ) -> Result<(ExecutedBlock, ChainInfoResponse), WorkerError> {
-        ChainWorkerStateWithTemporaryChanges::new(self)
+        block: ProposedBlock,
+        round: Option<u32>,
+        published_blobs: &[Blob],
+    ) -> Result<(Block, ChainInfoResponse), WorkerError> {
+        let (block, response) = ChainWorkerStateWithTemporaryChanges::new(self)
             .await
-            .stage_block_execution(block)
-            .await
+            .stage_block_execution(block, round, published_blobs)
+            .await?;
+        Ok((block, response))
     }
 
     /// Processes a leader timeout issued for this multi-owner chain.
@@ -196,13 +206,29 @@ where
     }
 
     /// Handles a proposal for the next block for this chain.
+    #[tracing::instrument(level = "debug", skip(self))]
     pub(super) async fn handle_block_proposal(
         &mut self,
         proposal: BlockProposal,
     ) -> Result<(ChainInfoResponse, NetworkActions), WorkerError> {
+        self.ensure_is_active().await?;
+        if ChainWorkerStateWithTemporaryChanges::new(&mut *self)
+            .await
+            .check_proposed_block(&proposal)
+            .await?
+            == manager::Outcome::Skip
+        {
+            // Skipping: We already voted for this block.
+            let info = ChainInfoResponse::new(&self.chain, self.config.key_pair());
+            return Ok((info, NetworkActions::default()));
+        };
+        let published_blobs = ChainWorkerStateWithAttemptedChanges::new(&mut *self)
+            .await
+            .load_proposal_blobs(&proposal)
+            .await?;
         let validation_outcome = ChainWorkerStateWithTemporaryChanges::new(self)
             .await
-            .validate_block(&proposal)
+            .validate_proposal_content(&proposal.content, &published_blobs)
             .await?;
 
         let actions = if let Some((outcome, local_time)) = validation_outcome {
@@ -222,6 +248,7 @@ where
     }
 
     /// Processes a validated block issued for this multi-owner chain.
+    #[tracing::instrument(level = "debug", skip(self))]
     pub(super) async fn process_validated_block(
         &mut self,
         certificate: ValidatedBlockCertificate,
@@ -233,6 +260,7 @@ where
     }
 
     /// Processes a confirmed block (aka a commit).
+    #[tracing::instrument(level = "debug", skip(self))]
     pub(super) async fn process_confirmed_block(
         &mut self,
         certificate: ConfirmedBlockCertificate,
@@ -245,11 +273,12 @@ where
     }
 
     /// Updates the chain's inboxes, receiving messages from a cross-chain update.
+    #[tracing::instrument(level = "debug", skip(self))]
     pub(super) async fn process_cross_chain_update(
         &mut self,
-        origin: Origin,
+        origin: ChainId,
         bundles: Vec<(Epoch, MessageBundle)>,
-    ) -> Result<Option<(BlockHeight, NetworkActions)>, WorkerError> {
+    ) -> Result<Option<BlockHeight>, WorkerError> {
         ChainWorkerStateWithAttemptedChanges::new(self)
             .await
             .process_cross_chain_update(origin, bundles)
@@ -259,15 +288,17 @@ where
     /// Handles the cross-chain request confirming that the recipient was updated.
     pub(super) async fn confirm_updated_recipient(
         &mut self,
-        latest_heights: Vec<(Target, BlockHeight)>,
+        recipient: ChainId,
+        latest_height: BlockHeight,
     ) -> Result<(), WorkerError> {
         ChainWorkerStateWithAttemptedChanges::new(self)
             .await
-            .confirm_updated_recipient(latest_heights)
+            .confirm_updated_recipient(recipient, latest_height)
             .await
     }
 
     /// Handles a [`ChainInfoQuery`], potentially voting on the next block.
+    #[tracing::instrument(level = "debug", skip(self))]
     pub(super) async fn handle_chain_info_query(
         &mut self,
         query: ChainInfoQuery,
@@ -293,13 +324,16 @@ where
         Ok((response, actions))
     }
 
-    /// Returns the requested blob, if it belongs to the current locked block or pending proposal.
+    /// Returns the requested blob, if it belongs to the current locking block or pending proposal.
     pub(super) async fn download_pending_blob(&self, blob_id: BlobId) -> Result<Blob, WorkerError> {
-        let maybe_blob = self.chain.manager.pending_blob(&blob_id).await?;
-        maybe_blob.ok_or_else(|| WorkerError::BlobsNotFound(vec![blob_id]))
+        if let Some(blob) = self.chain.manager.pending_blob(&blob_id).await? {
+            return Ok(blob);
+        }
+        Ok(self.storage.read_blob(blob_id).await?)
     }
 
     /// Adds the blob to pending blocks or validated block certificates that are missing it.
+    #[tracing::instrument(level = "debug", skip(self))]
     pub(super) async fn handle_pending_blob(
         &mut self,
         blob: Blob,
@@ -311,23 +345,24 @@ where
     }
 
     /// Ensures that the current chain is active, returning an error otherwise.
-    fn ensure_is_active(&mut self) -> Result<(), WorkerError> {
+    async fn ensure_is_active(&mut self) -> Result<(), WorkerError> {
         if !self.knows_chain_is_active {
-            self.chain.ensure_is_active()?;
+            let local_time = self.storage.clock().current_time();
+            self.chain.ensure_is_active(local_time).await?;
             self.knows_chain_is_active = true;
         }
         Ok(())
     }
 
-    /// Returns the blobs required by the given executed block. The ones that are not passed in
-    /// are read from the chain manager or from storage.
+    /// Reads the blobs from the chain manager or from storage. Returns an error if any are
+    /// missing.
     async fn get_required_blobs(
         &self,
-        required_blob_ids: HashSet<BlobId>,
-        blobs: &[Blob],
+        required_blob_ids: impl IntoIterator<Item = BlobId>,
+        created_blobs: &BTreeMap<BlobId, Blob>,
     ) -> Result<BTreeMap<BlobId, Blob>, WorkerError> {
         let maybe_blobs = self
-            .maybe_get_required_blobs(required_blob_ids, blobs)
+            .maybe_get_required_blobs(required_blob_ids, Some(created_blobs))
             .await?;
         let not_found_blob_ids = missing_blob_ids(&maybe_blobs);
         ensure!(
@@ -340,30 +375,33 @@ where
             .collect())
     }
 
-    /// Returns the blobs required by the given executed block. The ones that are not passed in
-    /// are read from the chain manager or from storage.
+    /// Tries to read the blobs from the chain manager or storage. Returns `None` if not found.
     async fn maybe_get_required_blobs(
         &self,
-        required_blob_ids: HashSet<BlobId>,
-        provided_blobs: &[Blob],
+        blob_ids: impl IntoIterator<Item = BlobId>,
+        created_blobs: Option<&BTreeMap<BlobId, Blob>>,
     ) -> Result<BTreeMap<BlobId, Option<Blob>>, WorkerError> {
-        let required_blob_ids = required_blob_ids.into_iter();
-        let mut maybe_blobs = BTreeMap::from_iter(required_blob_ids.map(|blob_id| (blob_id, None)));
+        let mut maybe_blobs = BTreeMap::from_iter(blob_ids.into_iter().zip(iter::repeat(None)));
 
-        for blob in provided_blobs {
-            if let Some(maybe_blob) = maybe_blobs.get_mut(&blob.id()) {
-                *maybe_blob = Some(blob.clone());
-            }
-        }
         for (blob_id, maybe_blob) in &mut maybe_blobs {
-            if maybe_blob.is_some() {
-                continue;
-            }
-            if let Some(blob) = self.chain.manager.pending_blob(blob_id).await? {
+            if let Some(blob) = created_blobs.and_then(|blob_map| blob_map.get(blob_id)) {
+                *maybe_blob = Some(blob.clone());
+            } else if let Some(blob) = self.chain.manager.pending_blob(blob_id).await? {
                 *maybe_blob = Some(blob);
-            } else if let Some(Some(blob)) = self.chain.pending_validated_blobs.get(blob_id).await?
-            {
+            } else if let Some(blob) = self.chain.pending_validated_blobs.get(blob_id).await? {
                 *maybe_blob = Some(blob);
+            } else {
+                for (_, pending_blobs) in self
+                    .chain
+                    .pending_proposed_blobs
+                    .try_load_all_entries()
+                    .await?
+                {
+                    if let Some(blob) = pending_blobs.get(blob_id).await? {
+                        *maybe_blob = Some(blob);
+                        break;
+                    }
+                }
             }
         }
         let missing_blob_ids = missing_blob_ids(&maybe_blobs);
@@ -379,26 +417,24 @@ where
     ///
     /// Chains that are not tracked are usually processed only because they sent some message
     /// to one of the tracked chains. In most use cases, their children won't be of interest.
-    fn track_newly_created_chains(&self, executed_block: &ExecutedBlock) {
+    fn track_newly_created_chains(
+        &self,
+        proposed_block: &ProposedBlock,
+        outcome: &BlockExecutionOutcome,
+    ) {
         if let Some(tracked_chains) = self.tracked_chains.as_ref() {
             if !tracked_chains
                 .read()
                 .expect("Panics should not happen while holding a lock to `tracked_chains`")
-                .contains(&executed_block.proposal.chain_id)
+                .contains(&proposed_block.chain_id)
             {
                 return; // The parent chain is not tracked; don't track the child.
             }
-            let messages = executed_block.messages().iter().flatten();
-            let open_chain_message_indices =
-                messages
-                    .enumerate()
-                    .filter_map(|(index, outgoing_message)| match outgoing_message.message {
-                        Message::System(SystemMessage::OpenChain(_)) => Some(index),
-                        _ => None,
-                    });
-            let open_chain_message_ids =
-                open_chain_message_indices.map(|index| executed_block.message_id(index as u32));
-            let new_chain_ids = open_chain_message_ids.map(ChainId::child);
+            let new_chain_ids = outcome
+                .created_blobs_ids()
+                .into_iter()
+                .filter(|blob_id| blob_id.blob_type == BlobType::ChainDescription)
+                .map(|blob_id| ChainId(blob_id.hash));
 
             tracked_chains
                 .write()
@@ -409,48 +445,29 @@ where
 
     /// Loads pending cross-chain requests.
     async fn create_network_actions(&self) -> Result<NetworkActions, WorkerError> {
-        let mut heights_by_recipient = BTreeMap::<_, BTreeMap<_, _>>::new();
+        let mut heights_by_recipient = BTreeMap::<_, Vec<_>>::new();
         let mut targets = self.chain.outboxes.indices().await?;
         if let Some(tracked_chains) = self.tracked_chains.as_ref() {
-            let publishers = self
-                .chain
-                .execution_state
-                .system
-                .subscriptions
-                .indices()
-                .await?
-                .iter()
-                .map(|subscription| subscription.chain_id)
-                .collect::<HashSet<_>>();
             let tracked_chains = tracked_chains
                 .read()
                 .expect("Panics should not happen while holding a lock to `tracked_chains`");
-            targets.retain(|target| {
-                tracked_chains.contains(&target.recipient) || publishers.contains(&target.recipient)
-            });
+            targets.retain(|target| tracked_chains.contains(target));
         }
         let outboxes = self.chain.outboxes.try_load_entries(&targets).await?;
         for (target, outbox) in targets.into_iter().zip(outboxes) {
             let outbox = outbox.expect("Only existing outboxes should be referenced by `indices`");
             let heights = outbox.queue.elements().await?;
-            heights_by_recipient
-                .entry(target.recipient)
-                .or_default()
-                .insert(target.medium, heights);
+            heights_by_recipient.insert(target, heights);
         }
         self.create_cross_chain_requests(heights_by_recipient).await
     }
 
     async fn create_cross_chain_requests(
         &self,
-        heights_by_recipient: BTreeMap<ChainId, BTreeMap<Medium, Vec<BlockHeight>>>,
+        heights_by_recipient: BTreeMap<ChainId, Vec<BlockHeight>>,
     ) -> Result<NetworkActions, WorkerError> {
         // Load all the certificates we will need, regardless of the medium.
-        let heights = BTreeSet::from_iter(
-            heights_by_recipient
-                .iter()
-                .flat_map(|(_, height_map)| height_map.iter().flat_map(|(_, vec)| vec).copied()),
-        );
+        let heights = BTreeSet::from_iter(heights_by_recipient.values().flatten().copied());
         let heights_usize = heights
             .iter()
             .copied()
@@ -474,24 +491,18 @@ where
             .collect::<HashMap<_, _>>();
         // For each medium, select the relevant messages.
         let mut actions = NetworkActions::default();
-        for (recipient, height_map) in heights_by_recipient {
-            let mut bundle_vecs = Vec::new();
-            for (medium, heights) in height_map {
-                let mut bundles = Vec::new();
-                for height in heights {
-                    let cert = certificates.get(&height).ok_or_else(|| {
-                        ChainError::InternalError("missing certificates".to_string())
-                    })?;
-                    bundles.extend(cert.message_bundles_for(&medium, recipient));
-                }
-                if !bundles.is_empty() {
-                    bundle_vecs.push((medium, bundles));
-                }
+        for (recipient, heights) in heights_by_recipient {
+            let mut bundles = Vec::new();
+            for height in heights {
+                let cert = certificates
+                    .get(&height)
+                    .ok_or_else(|| ChainError::InternalError("missing certificates".to_string()))?;
+                bundles.extend(cert.message_bundles_for(recipient));
             }
             let request = CrossChainRequest::UpdateRecipient {
                 sender: self.chain.chain_id(),
                 recipient,
-                bundle_vecs,
+                bundles,
             };
             actions.cross_chain_requests.push(request);
         }
@@ -512,26 +523,14 @@ where
         };
         let mut targets = self.chain.outboxes.indices().await?;
         {
-            let publishers = self
-                .chain
-                .execution_state
-                .system
-                .subscriptions
-                .indices()
-                .await?
-                .iter()
-                .map(|subscription| subscription.chain_id)
-                .collect::<HashSet<_>>();
             let tracked_chains = tracked_chains.read().unwrap();
-            targets.retain(|target| {
-                tracked_chains.contains(&target.recipient) || publishers.contains(&target.recipient)
-            });
+            targets.retain(|target| tracked_chains.contains(target));
         }
         let outboxes = self.chain.outboxes.try_load_entries(&targets).await?;
         for outbox in outboxes {
             let outbox = outbox.expect("Only existing outboxes should be referenced by `indices`");
-            let front = outbox.queue.front().await?;
-            if front.is_some_and(|key| key <= height) {
+            let front = outbox.queue.front();
+            if front.is_some_and(|key| *key <= height) {
                 return Ok(false);
             }
         }
@@ -541,7 +540,7 @@ where
     /// Updates the received certificate trackers to at least the given values.
     pub async fn update_received_certificate_trackers(
         &mut self,
-        new_trackers: BTreeMap<ValidatorName, u64>,
+        new_trackers: BTreeMap<ValidatorPublicKey, u64>,
     ) -> Result<(), WorkerError> {
         ChainWorkerStateWithAttemptedChanges::new(self)
             .await
@@ -555,7 +554,7 @@ fn missing_blob_ids(maybe_blobs: &BTreeMap<BlobId, Option<Blob>>) -> Vec<BlobId>
     maybe_blobs
         .iter()
         .filter(|(_, maybe_blob)| maybe_blob.is_none())
-        .map(|(chain_id, _)| *chain_id)
+        .map(|(blob_id, _)| *blob_id)
         .collect()
 }
 

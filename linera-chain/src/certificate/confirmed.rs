@@ -3,47 +3,34 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use linera_base::{
-    crypto::Signature,
-    data_types::Round,
-    hashed::Hashed,
-    identifiers::{BlobId, ChainId, MessageId},
+    crypto::{ValidatorPublicKey, ValidatorSignature},
+    data_types::{Epoch, Round},
+    identifiers::ChainId,
 };
-use linera_execution::committee::{Epoch, ValidatorName};
 use serde::{ser::SerializeStruct, Deserialize, Deserializer, Serialize};
 
 use super::{generic::GenericCertificate, Certificate};
 use crate::{
     block::{Block, ConfirmedBlock, ConversionError},
-    data_types::{Medium, MessageBundle},
+    data_types::MessageBundle,
 };
 
 impl GenericCertificate<ConfirmedBlock> {
-    /// Returns reference to the `ExecutedBlock` contained in this certificate.
+    /// Returns reference to the `Block` contained in this certificate.
     pub fn block(&self) -> &Block {
         self.inner().block()
     }
 
-    /// Returns whether this value contains the message with the specified ID.
-    pub fn has_message(&self, message_id: &MessageId) -> bool {
-        self.block().message_by_id(message_id).is_some()
-    }
-
-    /// Returns the bundles of messages sent via the given medium to the specified
-    /// recipient. Messages originating from different transactions of the original block
-    /// are kept in separate bundles. If the medium is a channel, does not verify that the
-    /// recipient is actually subscribed to that channel.
-    pub fn message_bundles_for<'a>(
-        &'a self,
-        medium: &'a Medium,
+    /// Returns the bundles of messages sent to the specified recipient.
+    /// Messages originating from different transactions of the original block
+    /// are kept in separate bundles.
+    pub fn message_bundles_for(
+        &self,
         recipient: ChainId,
-    ) -> impl Iterator<Item = (Epoch, MessageBundle)> + 'a {
+    ) -> impl Iterator<Item = (Epoch, MessageBundle)> + '_ {
         let certificate_hash = self.hash();
         self.block()
-            .message_bundles_for(medium, recipient, certificate_hash)
-    }
-
-    pub fn requires_blob(&self, blob_id: &BlobId) -> bool {
-        self.block().requires_blob(blob_id)
+            .message_bundles_for(recipient, certificate_hash)
     }
 
     #[cfg(with_testing)]
@@ -90,9 +77,9 @@ impl<'de> Deserialize<'de> for GenericCertificate<ConfirmedBlock> {
         #[derive(Debug, Deserialize)]
         #[serde(rename = "ConfirmedBlockCertificate")]
         struct Helper {
-            value: Hashed<ConfirmedBlock>,
+            value: ConfirmedBlock,
             round: Round,
-            signatures: Vec<(ValidatorName, Signature)>,
+            signatures: Vec<(ValidatorPublicKey, ValidatorSignature)>,
         }
 
         let helper = Helper::deserialize(deserializer)?;

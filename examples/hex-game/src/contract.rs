@@ -8,8 +8,8 @@ mod state;
 use async_graphql::ComplexObject;
 use hex_game::{Board, Clock, HexAbi, HexOutcome, Operation, Timeouts};
 use linera_sdk::{
-    base::{
-        Amount, ApplicationPermissions, ChainId, ChainOwnership, Owner, TimeoutConfig,
+    linera_base_types::{
+        AccountOwner, Amount, ApplicationPermissions, ChainId, ChainOwnership, TimeoutConfig,
         WithContractAbi,
     },
     views::{RootView, View},
@@ -33,6 +33,7 @@ impl Contract for HexContract {
     type Message = Message;
     type InstantiationArgument = Timeouts;
     type Parameters = ();
+    type EventValue = ();
 
     async fn load(runtime: ContractRuntime<Self>) -> Self {
         let state = HexState::load(runtime.root_view_storage_context())
@@ -141,7 +142,7 @@ impl HexContract {
 
     async fn execute_start(
         &mut self,
-        players: [Owner; 2],
+        players: [AccountOwner; 2],
         board_size: u16,
         fee_budget: Amount,
         timeouts: Option<Timeouts>,
@@ -154,17 +155,14 @@ impl HexContract {
         );
         let app_id = self.runtime.application_id();
         let permissions = ApplicationPermissions::new_single(app_id.forget_abi());
-        let (message_id, chain_id) = self.runtime.open_chain(ownership, permissions, fee_budget);
+        let chain_id = self.runtime.open_chain(ownership, permissions, fee_budget);
         for owner in &players {
             self.state
                 .game_chains
                 .get_mut_or_default(owner)
                 .await
                 .unwrap()
-                .insert(GameChain {
-                    message_id,
-                    chain_id,
-                });
+                .insert(GameChain { chain_id });
         }
         self.runtime.send_message(
             chain_id,
@@ -200,14 +198,17 @@ pub enum Message {
     /// Initializes a game. Sent from the main chain to a temporary chain.
     Start {
         /// The players.
-        players: [Owner; 2],
+        players: [AccountOwner; 2],
         /// The side length of the board. A typical size is 11.
         board_size: u16,
         /// Settings that determine how much time the players have to think about their turns.
         timeouts: Timeouts,
     },
     /// Reports the outcome of a game. Sent from a closed chain to the main chain.
-    End { winner: Owner, loser: Owner },
+    End {
+        winner: AccountOwner,
+        loser: AccountOwner,
+    },
 }
 
 /// This implementation is only nonempty in the service.

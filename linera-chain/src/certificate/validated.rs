@@ -2,8 +2,10 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use linera_base::{crypto::Signature, data_types::Round, hashed::Hashed, identifiers::BlobId};
-use linera_execution::committee::ValidatorName;
+use linera_base::{
+    crypto::{ValidatorPublicKey, ValidatorSignature},
+    data_types::Round,
+};
 use serde::{
     ser::{Serialize, SerializeStruct, Serializer},
     Deserialize, Deserializer,
@@ -13,10 +15,6 @@ use super::{generic::GenericCertificate, Certificate};
 use crate::block::{Block, ConversionError, ValidatedBlock};
 
 impl GenericCertificate<ValidatedBlock> {
-    pub fn requires_blob(&self, blob_id: &BlobId) -> bool {
-        self.block().requires_blob(blob_id)
-    }
-
     #[cfg(with_testing)]
     pub fn outgoing_message_count(&self) -> usize {
         self.block().messages().iter().map(Vec::len).sum()
@@ -63,9 +61,9 @@ impl<'de> Deserialize<'de> for GenericCertificate<ValidatedBlock> {
         #[derive(Deserialize)]
         #[serde(rename = "ValidatedBlockCertificate")]
         struct Inner {
-            value: Hashed<ValidatedBlock>,
+            value: ValidatedBlock,
             round: Round,
-            signatures: Vec<(ValidatorName, Signature)>,
+            signatures: Vec<(ValidatorPublicKey, ValidatorSignature)>,
         }
         let inner = Inner::deserialize(deserializer)?;
         if !crate::data_types::is_strictly_ordered(&inner.signatures) {

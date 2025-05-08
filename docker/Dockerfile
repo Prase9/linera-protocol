@@ -9,6 +9,8 @@
 # - `target` is a Rust target quadruple. Currently known to be
 #   supported are `x86_64-unknown-linux-gnu` and
 #   `aarch64-unknown-linux-gnu`.
+# - `build_flag` is either "--release" or an empty string.
+# - `build_folder` is either "release" or "debug".
 
 # Stage 1 - Generate recipe file for dependencies
 
@@ -20,10 +22,14 @@ ARG build_date
 ARG target=x86_64-unknown-linux-gnu
 ARG binaries=
 ARG copy=${binaries:+_copy}
+ARG build_flag=--release
+ARG build_folder=release
 
 FROM rust:1.74-slim-bookworm AS builder
 ARG git_commit
 ARG target
+ARG build_flag
+ARG build_folder
 
 RUN apt-get update && apt-get install -y \
     pkg-config \
@@ -38,6 +44,7 @@ COPY linera-core linera-core
 COPY linera-ethereum linera-ethereum
 COPY linera-execution linera-execution
 COPY linera-explorer linera-explorer
+COPY linera-faucet linera-faucet
 COPY linera-indexer linera-indexer
 COPY linera-rpc linera-rpc
 COPY linera-sdk linera-sdk
@@ -57,7 +64,7 @@ COPY rust-toolchain* Cargo.* ./
 
 ENV GIT_COMMIT=${git_commit}
 
-RUN cargo build --release \
+RUN cargo build ${build_flag:+"$build_flag"} \
     --target "$target" \
     --bin linera \
     --bin linera-proxy \
@@ -65,12 +72,10 @@ RUN cargo build --release \
     --features scylladb,metrics
 
 RUN mv \
-    target/"$target"/release/linera \
-    target/"$target"/release/linera-proxy \
-    target/"$target"/release/linera-server \
+    target/"$target"/"$build_folder"/linera \
+    target/"$target"/"$build_folder"/linera-proxy \
+    target/"$target"/"$build_folder"/linera-server \
     ./
-
-RUN strip linera linera-proxy linera-server
 
 # Optionally copy binaries instead of using the build images above
 FROM scratch AS builder_copy

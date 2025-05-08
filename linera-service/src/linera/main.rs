@@ -6,85 +6,67 @@
 #![deny(clippy::large_futures)]
 
 use std::{
-    borrow::Cow, collections::HashMap, env, num::NonZeroUsize, path::PathBuf, process, sync::Arc,
+    collections::{BTreeMap, BTreeSet, HashMap},
+    env,
+    ops::Deref,
+    path::PathBuf,
+    process,
+    sync::Arc,
     time::Instant,
 };
 
-use anyhow::{anyhow, bail, ensure, Context};
+use anyhow::{anyhow, bail, ensure, Context, Error};
 use async_trait::async_trait;
 use chrono::Utc;
 use colored::Colorize;
+use command::{ClientCommand, DatabaseToolCommand, NetCommand, ProjectCommand, WalletCommand};
 use futures::{lock::Mutex, FutureExt as _, StreamExt};
 use linera_base::{
-    crypto::{CryptoHash, CryptoRng},
-    data_types::{ApplicationPermissions, Timestamp},
-    identifiers::{AccountOwner, ChainDescription, ChainId, MessageId, Owner},
+    bcs,
+    crypto::{CryptoHash, InMemorySigner, Signer},
+    data_types::{
+        ApplicationPermissions, ChainDescription, ChainOrigin, Epoch, InitialChainConfig, Timestamp,
+    },
+    identifiers::{AccountOwner, ChainId},
+    listen_for_shutdown_signals,
     ownership::ChainOwnership,
 };
 use linera_client::{
-    chain_listener::ClientContext as _,
     client_context::ClientContext,
-    client_options::{
-        ClientCommand, ClientOptions, DatabaseToolCommand, NetCommand, ProjectCommand,
-        WalletCommand,
-    },
-    config::{CommitteeConfig, GenesisConfig},
+    client_options::ClientContextOptions,
+    config::{CommitteeConfig, GenesisConfig, SignerState, WalletState},
     persistent::{self, Persist},
-    storage::Runnable,
     wallet::{UserChain, Wallet},
 };
 use linera_core::{
-    client,
-    data_types::{ChainInfoQuery, ClientOutcome},
-    node::{CrossChainMessageDelivery, ValidatorNodeProvider},
-    remote_node::RemoteNode,
-    worker::Reason,
-    JoinSetExt as _, DEFAULT_GRACE_PERIOD,
+    data_types::ClientOutcome, node::ValidatorNodeProvider, worker::Reason, JoinSetExt as _,
 };
 use linera_execution::{
-    committee::{Committee, ValidatorName, ValidatorState},
-    Message, ResourceControlPolicy, SystemMessage,
+    committee::{Committee, ValidatorState},
+    WasmRuntime, WithWasmDefault as _,
 };
+use linera_faucet_server::FaucetService;
 use linera_service::{
     cli_wrappers,
-    faucet::FaucetService,
     node_service::NodeService,
     project::{self, Project},
+    storage::{Runnable, RunnableWithStore, StorageConfigNamespace},
     util, wallet,
 };
-use linera_storage::Storage;
-use linera_views::store::CommonStoreConfig;
+use linera_storage::{DbStorage, Storage};
+use linera_views::{
+    lru_caching::StorageCacheConfig,
+    store::{CommonStoreConfig, KeyValueStore},
+};
 use serde_json::Value;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn, Instrument as _};
 
+mod command;
 mod net_up_utils;
 
-#[cfg(feature = "benchmark")]
-use {
-    linera_base::hashed::Hashed,
-    linera_chain::types::ConfirmedBlock,
-    linera_core::data_types::ChainInfoResponse,
-    linera_rpc::{HandleConfirmedCertificateRequest, RpcMessage},
-    std::collections::HashSet,
-};
-
 use crate::persistent::PersistExt as _;
-
-#[cfg(feature = "benchmark")]
-fn deserialize_response(response: RpcMessage) -> Option<ChainInfoResponse> {
-    match response {
-        RpcMessage::ChainInfoResponse(info) => Some(*info),
-        RpcMessage::Error(error) => {
-            error!("Received error value: {}", error);
-            None
-        }
-        _ => {
-            error!("Unexpected return value");
-            None
-        }
-    }
-}
 
 struct Job(ClientOptions);
 
@@ -111,7 +93,8 @@ impl Runnable for Job {
     {
         let Job(options) = self;
         let wallet = options.wallet().await?;
-        let mut context = ClientContext::new(storage.clone(), options.clone(), wallet);
+        let mut signer = options.signer().await?;
+
         let command = options.command;
 
         use ClientCommand::*;
@@ -121,14 +104,13 @@ impl Runnable for Job {
                 recipient,
                 amount,
             } => {
-                let chain_client = context.make_chain_client(sender.chain_id)?;
-                let owner = match sender.owner {
-                    Some(AccountOwner::User(owner)) => Some(owner),
-                    Some(AccountOwner::Application(_)) => {
-                        bail!("Can't transfer from an application account")
-                    }
-                    None => None,
-                };
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
+                let chain_client = context.make_chain_client(sender.chain_id).await?;
                 info!(
                     "Starting transfer of {} native tokens from {} to {}",
                     amount, sender, recipient
@@ -139,7 +121,7 @@ impl Runnable for Job {
                         let chain_client = chain_client.clone();
                         async move {
                             chain_client
-                                .transfer_to_account(owner, amount, recipient)
+                                .transfer_to_account(sender.owner, amount, recipient)
                                 .await
                         }
                     })
@@ -155,18 +137,19 @@ impl Runnable for Job {
                 owner,
                 balance,
             } => {
+                let new_owner = owner.unwrap_or_else(|| signer.generate_new().into());
+                signer.persist().await?;
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
                 let chain_id = chain_id.unwrap_or_else(|| context.default_chain());
-                let chain_client = context.make_chain_client(chain_id)?;
-                let (new_owner, key_pair) = match owner {
-                    Some(owner) => (owner, None),
-                    None => {
-                        let key_pair = context.wallet.generate_key_pair();
-                        (key_pair.public().into(), Some(key_pair))
-                    }
-                };
+                let chain_client = context.make_chain_client(chain_id).await?;
                 info!("Opening a new chain from existing chain {}", chain_id);
                 let time_start = Instant::now();
-                let (message_id, certificate) = context
+                let (id, certificate) = context
                     .apply_client_command(&chain_client, |chain_client| {
                         let ownership = ChainOwnership::single(new_owner);
                         let chain_client = chain_client.clone();
@@ -178,10 +161,9 @@ impl Runnable for Job {
                     })
                     .await
                     .context("Failed to open chain")?;
-                let id = ChainId::child(message_id);
                 let timestamp = certificate.block().header.timestamp;
                 context
-                    .update_wallet_for_new_chain(id, key_pair, timestamp)
+                    .update_wallet_for_new_chain(id, Some(new_owner), timestamp)
                     .await?;
                 let time_total = time_start.elapsed();
                 info!(
@@ -189,9 +171,9 @@ impl Runnable for Job {
                     time_total.as_millis()
                 );
                 debug!("{:?}", certificate);
-                // Print the new chain ID and message ID on stdout for scripting purposes.
-                println!("{}", message_id);
-                println!("{}", ChainId::child(message_id));
+                // Print the new chain ID, and owner on stdout for scripting purposes.
+                println!("{}", id);
+                println!("{}", new_owner);
             }
 
             OpenMultiOwnerChain {
@@ -200,8 +182,14 @@ impl Runnable for Job {
                 ownership_config,
                 application_permissions_config,
             } => {
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
                 let chain_id = chain_id.unwrap_or_else(|| context.default_chain());
-                let chain_client = context.make_chain_client(chain_id)?;
+                let chain_client = context.make_chain_client(chain_id).await?;
                 info!(
                     "Opening a new multi-owner chain from existing chain {}",
                     chain_id
@@ -210,7 +198,7 @@ impl Runnable for Job {
                 let ownership = ChainOwnership::try_from(ownership_config)?;
                 let application_permissions =
                     ApplicationPermissions::from(application_permissions_config);
-                let (message_id, certificate) = context
+                let (id, certificate) = context
                     .apply_client_command(&chain_client, |chain_client| {
                         let ownership = ownership.clone();
                         let application_permissions = application_permissions.clone();
@@ -223,12 +211,11 @@ impl Runnable for Job {
                     })
                     .await
                     .context("Failed to open chain")?;
-                // No key pair. This chain can be assigned explicitly using the assign command.
-                let key_pair = None;
-                let id = ChainId::child(message_id);
+                // No owner. This chain can be assigned explicitly using the assign command.
+                let owner = None;
                 let timestamp = certificate.block().header.timestamp;
                 context
-                    .update_wallet_for_new_chain(id, key_pair, timestamp)
+                    .update_wallet_for_new_chain(id, owner, timestamp)
                     .await?;
                 let time_total = time_start.elapsed();
                 info!(
@@ -236,22 +223,45 @@ impl Runnable for Job {
                     time_total.as_millis()
                 );
                 debug!("{:?}", certificate);
-                // Print the new chain ID and message ID on stdout for scripting purposes.
-                println!("{}", message_id);
-                println!("{}", ChainId::child(message_id));
+                // Print the new chain ID on stdout for scripting purposes.
+                println!("{}", id);
             }
 
             ChangeOwnership {
                 chain_id,
                 ownership_config,
-            } => context.change_ownership(chain_id, ownership_config).await?,
+            } => {
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
+                context.change_ownership(chain_id, ownership_config).await?
+            }
+
+            SetPreferredOwner { chain_id, owner } => {
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
+                context.set_preferred_owner(chain_id, owner).await?
+            }
 
             ChangeApplicationPermissions {
                 chain_id,
                 application_permissions_config,
             } => {
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
                 let chain_id = chain_id.unwrap_or_else(|| context.default_chain());
-                let chain_client = context.make_chain_client(chain_id)?;
+                let chain_client = context.make_chain_client(chain_id).await?;
                 info!("Changing application permissions for chain {}", chain_id);
                 let time_start = Instant::now();
                 let application_permissions =
@@ -277,7 +287,13 @@ impl Runnable for Job {
             }
 
             CloseChain { chain_id } => {
-                let chain_client = context.make_chain_client(chain_id)?;
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
+                let chain_client = context.make_chain_client(chain_id).await?;
                 info!("Closing chain {}", chain_id);
                 let time_start = Instant::now();
                 let result = context
@@ -289,7 +305,7 @@ impl Runnable for Job {
                 let certificate = match result {
                     Ok(Some(certificate)) => certificate,
                     Ok(None) => {
-                        tracing::info!("Chain is already closed; nothing to do.");
+                        info!("Chain is already closed; nothing to do.");
                         return Ok(());
                     }
                     Err(error) => Err(error).context("Failed to close chain")?,
@@ -303,48 +319,57 @@ impl Runnable for Job {
             }
 
             LocalBalance { account } => {
+                let context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
                 let account = account.unwrap_or_else(|| context.default_account());
-                let chain_client = context.make_chain_client(account.chain_id)?;
+                let chain_client = context.make_chain_client(account.chain_id).await?;
                 info!("Reading the balance of {} from the local state", account);
                 let time_start = Instant::now();
-                let balance = match account.owner {
-                    Some(owner) => chain_client.local_owner_balance(owner).await?,
-                    None => chain_client.local_balance().await?,
-                };
+                let balance = chain_client.local_owner_balance(account.owner).await?;
                 let time_total = time_start.elapsed();
                 info!("Local balance obtained after {} ms", time_total.as_millis());
                 println!("{}", balance);
             }
 
             QueryBalance { account } => {
+                let context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
                 let account = account.unwrap_or_else(|| context.default_account());
-                let chain_client = context.make_chain_client(account.chain_id)?;
+                let chain_client = context.make_chain_client(account.chain_id).await?;
                 info!(
                     "Evaluating the local balance of {account} by staging execution of known \
                     incoming messages"
                 );
                 let time_start = Instant::now();
-                let balance = match account.owner {
-                    Some(owner) => chain_client.query_owner_balance(owner).await?,
-                    None => chain_client.query_balance().await?,
-                };
+                let balance = chain_client.query_owner_balance(account.owner).await?;
                 let time_total = time_start.elapsed();
                 info!("Balance obtained after {} ms", time_total.as_millis());
                 println!("{}", balance);
             }
 
             SyncBalance { account } => {
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
                 let account = account.unwrap_or_else(|| context.default_account());
-                let chain_client = context.make_chain_client(account.chain_id)?;
+                let chain_client = context.make_chain_client(account.chain_id).await?;
                 info!("Synchronizing chain information and querying the local balance");
                 warn!("This command is deprecated. Use `linera sync && linera query-balance` instead.");
                 let time_start = Instant::now();
                 chain_client.synchronize_from_validators().await?;
-                let result = match account.owner {
-                    Some(owner) => chain_client.query_owner_balance(owner).await,
-                    None => chain_client.query_balance().await,
-                };
-                context.update_and_save_wallet(&chain_client).await?;
+                let result = chain_client.query_owner_balance(account.owner).await;
+                context.update_wallet_from_client(&chain_client).await?;
                 let balance = result.context("Failed to synchronize from validators")?;
                 let time_total = time_start.elapsed();
                 info!(
@@ -355,12 +380,18 @@ impl Runnable for Job {
             }
 
             Sync { chain_id } => {
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
                 let chain_id = chain_id.unwrap_or_else(|| context.default_chain());
-                let chain_client = context.make_chain_client(chain_id)?;
+                let chain_client = context.make_chain_client(chain_id).await?;
                 info!("Synchronizing chain information");
                 let time_start = Instant::now();
                 chain_client.synchronize_from_validators().await?;
-                context.update_and_save_wallet(&chain_client).await?;
+                context.update_wallet_from_client(&chain_client).await?;
                 let time_total = time_start.elapsed();
                 info!(
                     "Synchronized chain information in {} ms",
@@ -369,8 +400,14 @@ impl Runnable for Job {
             }
 
             ProcessInbox { chain_id } => {
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
                 let chain_id = chain_id.unwrap_or_else(|| context.default_chain());
-                let chain_client = context.make_chain_client(chain_id)?;
+                let chain_client = context.make_chain_client(chain_id).await?;
                 info!("Processing the inbox of chain {}", chain_id);
                 let time_start = Instant::now();
                 let certificates = context.process_inbox(&chain_client).await?;
@@ -385,185 +422,168 @@ impl Runnable for Job {
             QueryValidator {
                 address,
                 chain_id,
-                name,
+                public_key,
             } => {
-                use linera_core::node::ValidatorNode as _;
-
+                let context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
                 let node = context.make_node_provider().make_node(&address)?;
-                match node.get_version_info().await {
-                    Ok(version_info)
-                        if version_info.is_compatible_with(&linera_version::VERSION_INFO) =>
-                    {
-                        info!(
-                            "Version information for validator {address}: {}",
-                            version_info
-                        );
-                    }
-                    Ok(version_info) => error!(
-                        "Validator version {} is not compatible with local version {}.",
-                        version_info,
-                        linera_version::VERSION_INFO
-                    ),
-                    Err(error) => {
-                        error!(
-                            "Failed to get version information for validator {address}:\n{error}"
-                        )
-                    }
+                let mut has_errors = false;
+                if let Err(e) = context.check_compatible_version_info(&address, &node).await {
+                    error!("{}", e);
+                    has_errors = true;
                 }
-
-                let genesis_config_hash = context.wallet().genesis_config().hash();
-                match node.get_genesis_config_hash().await {
-                    Ok(hash) if hash == genesis_config_hash => {}
-                    Ok(hash) => error!(
-                        "Validator's genesis config hash {} does not match our own: {}.",
-                        hash, genesis_config_hash
-                    ),
-                    Err(error) => {
-                        error!(
-                            "Failed to get genesis config hash for validator {address}:\n{error}"
-                        )
-                    }
-                }
-
-                let chain_id = chain_id.unwrap_or_else(|| context.default_chain());
-                let query = linera_core::data_types::ChainInfoQuery::new(chain_id);
-                match node.handle_chain_info_query(query).await {
-                    Ok(response) => {
-                        info!(
-                            "Validator {address} sees chain {chain_id} at block height {} and epoch {:?}",
-                            response.info.next_block_height,
-                            response.info.epoch,
-                        );
-                        if let Some(name) = name {
-                            if response.check(&name).is_ok() {
-                                info!("Signature for public key {name} is OK.");
-                            } else {
-                                error!("Signature for public key {name} is NOT OK.");
-                            }
-                        }
+                match context
+                    .check_matching_network_description(&address, &node)
+                    .await
+                {
+                    Ok(genesis_config_hash) => {
+                        println!("{}", genesis_config_hash);
                     }
                     Err(e) => {
-                        error!("Failed to get chain info for validator {address} and chain {chain_id}:\n{e}");
+                        error!("{}", e);
+                        has_errors = true;
                     }
                 }
-
-                println!("{}", genesis_config_hash);
+                let chain_id = chain_id.unwrap_or_else(|| context.default_chain());
+                if let Err(e) = context
+                    .check_validator_chain_info_response(
+                        public_key.as_ref(),
+                        &address,
+                        &node,
+                        chain_id,
+                    )
+                    .await
+                {
+                    error!("{}", e);
+                    has_errors = true;
+                }
+                if has_errors {
+                    bail!("Found one or several issue(s) while querying validator {address}");
+                }
             }
 
             QueryValidators { chain_id } => {
-                use linera_core::node::ValidatorNode as _;
-
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
                 let chain_id = chain_id.unwrap_or_else(|| context.default_chain());
-                let chain_client = context.make_chain_client(chain_id)?;
+                let chain_client = context.make_chain_client(chain_id).await?;
                 info!("Querying validators about chain {}", chain_id);
                 let result = chain_client.local_committee().await;
-                context.update_and_save_wallet(&chain_client).await?;
+                context.update_wallet_from_client(&chain_client).await?;
                 let committee = result.context("Failed to get local committee")?;
                 info!(
                     "Using the local set of validators: {:?}",
                     committee.validators()
                 );
                 let node_provider = context.make_node_provider();
-                let mut num_ok_validators = 0;
-                let mut faulty_validators = vec![];
+                let mut faulty_validators = BTreeMap::<_, Vec<_>>::new();
                 for (name, state) in committee.validators() {
                     let address = &state.network_address;
                     let node = node_provider.make_node(address)?;
-                    match node.get_version_info().await {
-                        Ok(version_info) => {
-                            info!(
-                                "Version information for validator {name:?} at {address}:{}",
-                                version_info
-                            );
-                        }
-                        Err(e) => {
-                            error!("Failed to get version information for validator {name:?} at {address}:\n{e}");
-                            faulty_validators.push((
-                                name,
-                                address,
-                                "Failed to get version information.".to_string(),
-                            ));
-                            continue;
-                        }
+                    if let Err(e) = context.check_compatible_version_info(address, &node).await {
+                        error!("{}", e);
+                        faulty_validators
+                            .entry((name, address))
+                            .or_default()
+                            .push(e);
                     }
-                    let query = linera_core::data_types::ChainInfoQuery::new(chain_id);
-                    match node.handle_chain_info_query(query).await {
-                        Ok(response) => {
-                            info!(
-                                "Validator {name:?} at {address} sees chain {chain_id} at block height {} and epoch {:?}",
-                                response.info.next_block_height,
-                                response.info.epoch,
-                            );
-                            if response.check(name).is_ok() {
-                                info!("Signature for public key {name} is OK.");
-                                num_ok_validators += 1;
-                            } else {
-                                error!("Signature for public key {name} is NOT OK.");
-                                faulty_validators.push((name, address, format!("{:?}", response)));
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to get chain info for validator {name:?} at {address} and chain {chain_id}:\n{e}");
-                            faulty_validators.push((
-                                name,
-                                address,
-                                "Failed to get chain info.".to_string(),
-                            ));
-                            continue;
-                        }
+                    if let Err(e) = context
+                        .check_matching_network_description(address, &node)
+                        .await
+                    {
+                        error!("{}", e);
+                        faulty_validators
+                            .entry((name, address))
+                            .or_default()
+                            .push(e);
+                    }
+                    if let Err(e) = context
+                        .check_validator_chain_info_response(None, address, &node, chain_id)
+                        .await
+                    {
+                        error!("{}", e);
+                        faulty_validators
+                            .entry((name, address))
+                            .or_default()
+                            .push(e);
                     }
                 }
+                let num_ok_validators = committee.validators().len() - faulty_validators.len();
                 if !faulty_validators.is_empty() {
                     println!("{:#?}", faulty_validators);
                 }
-                println!("{}/{} OK.", num_ok_validators, committee.validators().len());
+                info!(
+                    "{}/{} validators are OK.",
+                    num_ok_validators,
+                    committee.validators().len()
+                );
+            }
+
+            SyncValidator {
+                address,
+                mut chains,
+            } => {
+                let context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
+
+                if chains.is_empty() {
+                    chains.push(context.default_chain());
+                }
+
+                let validator = context.make_node_provider().make_node(&address)?;
+
+                for chain_id in chains {
+                    let chain = context.make_chain_client(chain_id).await?;
+
+                    Box::pin(chain.sync_validator(validator.clone())).await?;
+                }
             }
 
             command @ (SetValidator { .. }
             | RemoveValidator { .. }
             | ResourceControlPolicy { .. }) => {
-                use linera_core::node::ValidatorNode as _;
-
                 info!("Starting operations to change validator set");
                 let time_start = Instant::now();
+                let context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
 
                 let context = Arc::new(Mutex::new(context));
                 let mut context = context.lock().await;
                 if let SetValidator {
-                    name,
+                    public_key: _,
+                    account_key: _,
                     address,
                     votes: _,
                     skip_online_check: false,
                 } = &command
                 {
                     let node = context.make_node_provider().make_node(address)?;
-                    match node.get_version_info().await {
-                        Ok(version_info)
-                            if version_info.is_compatible_with(&linera_version::VERSION_INFO) => {}
-                        Ok(version_info) => bail!(
-                            "Validator version {} is not compatible with local version {}.",
-                            version_info,
-                            linera_version::VERSION_INFO
-                        ),
-                        Err(error) => bail!(
-                            "Failed to get version information for validator {name:?} at {address}:\n{error}"
-                        ),
-                    }
-                    let genesis_config_hash = context.wallet().genesis_config().hash();
-                    match node.get_genesis_config_hash().await {
-                        Ok(hash) if hash == genesis_config_hash => {}
-                        Ok(hash) => bail!(
-                            "Validator's genesis config hash {} does not match our own: {}.",
-                            hash,
-                            genesis_config_hash
-                        ),
-                        Err(error) => bail!(
-                            "Failed to get genesis config hash for validator {name:?} at {address}:\n{error}"
-                        ),
-                    }
+                    context
+                        .check_compatible_version_info(address, &node)
+                        .await?;
+                    context
+                        .check_matching_network_description(address, &node)
+                        .await?;
                 }
-                let chain_client =
-                    context.make_chain_client(context.wallet.genesis_admin_chain())?;
+                let chain_client = context
+                    .make_chain_client(context.wallet.genesis_admin_chain())
+                    .await?;
                 let n = context
                     .process_inbox(&chain_client)
                     .await
@@ -583,111 +603,132 @@ impl Runnable for Job {
                             let mut validators = committee.validators().clone();
                             match command {
                                 SetValidator {
-                                    name,
+                                    public_key,
+                                    account_key,
                                     address,
                                     votes,
                                     skip_online_check: _,
                                 } => {
                                     validators.insert(
-                                        name,
+                                        public_key,
                                         ValidatorState {
                                             network_address: address,
                                             votes,
+                                            account_public_key: account_key,
                                         },
                                     );
                                 }
-                                RemoveValidator { name } => {
-                                    if validators.remove(&name).is_none() {
+                                RemoveValidator { public_key } => {
+                                    if validators.remove(&public_key).is_none() {
                                         warn!("Skipping removal of nonexistent validator");
                                         return Ok(ClientOutcome::Committed(None));
                                     }
                                 }
                                 ResourceControlPolicy {
                                     block,
-                                    fuel_unit,
+                                    wasm_fuel_unit,
+                                    evm_fuel_unit,
                                     read_operation,
                                     write_operation,
                                     byte_read,
                                     byte_written,
+                                    blob_read,
+                                    blob_published,
+                                    blob_byte_read,
+                                    blob_byte_published,
                                     byte_stored,
                                     operation,
                                     operation_byte,
                                     message,
                                     message_byte,
-                                    maximum_fuel_per_block,
-                                    maximum_executed_block_size,
+                                    service_as_oracle_query,
+                                    http_request,
+                                    maximum_wasm_fuel_per_block,
+                                    maximum_evm_fuel_per_block,
+                                    maximum_service_oracle_execution_ms,
+                                    maximum_block_size,
                                     maximum_blob_size,
+                                    maximum_published_blobs,
                                     maximum_bytecode_size,
                                     maximum_block_proposal_size,
                                     maximum_bytes_read_per_block,
                                     maximum_bytes_written_per_block,
+                                    maximum_oracle_response_bytes,
+                                    maximum_http_response_bytes,
+                                    http_request_timeout_ms,
+                                    http_request_allow_list,
                                 } => {
-                                    if let Some(block) = block {
-                                        policy.block = block;
-                                    }
-                                    if let Some(fuel_unit) = fuel_unit {
-                                        policy.fuel_unit = fuel_unit;
-                                    }
-                                    if let Some(read_operation) = read_operation {
-                                        policy.read_operation = read_operation;
-                                    }
-                                    if let Some(write_operation) = write_operation {
-                                        policy.write_operation = write_operation;
-                                    }
-                                    if let Some(byte_read) = byte_read {
-                                        policy.byte_read = byte_read;
-                                    }
-                                    if let Some(byte_written) = byte_written {
-                                        policy.byte_written = byte_written;
-                                    }
-                                    if let Some(byte_stored) = byte_stored {
-                                        policy.byte_stored = byte_stored;
-                                    }
-                                    if let Some(operation) = operation {
-                                        policy.operation = operation;
-                                    }
-                                    if let Some(operation_byte) = operation_byte {
-                                        policy.operation_byte = operation_byte;
-                                    }
-                                    if let Some(message) = message {
-                                        policy.message = message;
-                                    }
-                                    if let Some(message_byte) = message_byte {
-                                        policy.message_byte = message_byte;
-                                    }
-                                    if let Some(maximum_fuel_per_block) = maximum_fuel_per_block {
-                                        policy.maximum_fuel_per_block = maximum_fuel_per_block;
-                                    }
-                                    if let Some(maximum_executed_block_size) =
-                                        maximum_executed_block_size
-                                    {
-                                        policy.maximum_executed_block_size =
-                                            maximum_executed_block_size;
-                                    }
-                                    if let Some(maximum_bytecode_size) = maximum_bytecode_size {
-                                        policy.maximum_bytecode_size = maximum_bytecode_size;
-                                    }
-                                    if let Some(maximum_blob_size) = maximum_blob_size {
-                                        policy.maximum_blob_size = maximum_blob_size;
-                                    }
-                                    if let Some(maximum_block_proposal_size) =
-                                        maximum_block_proposal_size
-                                    {
-                                        policy.maximum_block_proposal_size =
-                                            maximum_block_proposal_size;
-                                    }
-                                    if let Some(maximum_bytes_read_per_block) =
-                                        maximum_bytes_read_per_block
-                                    {
-                                        policy.maximum_bytes_read_per_block =
-                                            maximum_bytes_read_per_block;
-                                    }
-                                    if let Some(maximum_bytes_written_per_block) =
-                                        maximum_bytes_written_per_block
-                                    {
-                                        policy.maximum_bytes_written_per_block =
-                                            maximum_bytes_written_per_block;
-                                    }
+                                    let existing_policy = policy.clone();
+                                    policy = linera_execution::ResourceControlPolicy {
+                                        block: block.unwrap_or(existing_policy.block),
+                                        wasm_fuel_unit: wasm_fuel_unit
+                                            .unwrap_or(existing_policy.wasm_fuel_unit),
+                                        evm_fuel_unit: evm_fuel_unit
+                                            .unwrap_or(existing_policy.evm_fuel_unit),
+                                        read_operation: read_operation
+                                            .unwrap_or(existing_policy.read_operation),
+                                        write_operation: write_operation
+                                            .unwrap_or(existing_policy.write_operation),
+                                        byte_read: byte_read.unwrap_or(existing_policy.byte_read),
+                                        byte_written: byte_written
+                                            .unwrap_or(existing_policy.byte_written),
+                                        blob_read: blob_read.unwrap_or(existing_policy.blob_read),
+                                        blob_published: blob_published
+                                            .unwrap_or(existing_policy.blob_published),
+                                        blob_byte_read: blob_byte_read
+                                            .unwrap_or(existing_policy.blob_byte_read),
+                                        blob_byte_published: blob_byte_published
+                                            .unwrap_or(existing_policy.blob_byte_published),
+                                        byte_stored: byte_stored
+                                            .unwrap_or(existing_policy.byte_stored),
+                                        operation: operation.unwrap_or(existing_policy.operation),
+                                        operation_byte: operation_byte
+                                            .unwrap_or(existing_policy.operation_byte),
+                                        message: message.unwrap_or(existing_policy.message),
+                                        message_byte: message_byte
+                                            .unwrap_or(existing_policy.message_byte),
+                                        service_as_oracle_query: service_as_oracle_query
+                                            .unwrap_or(existing_policy.service_as_oracle_query),
+                                        http_request: http_request
+                                            .unwrap_or(existing_policy.http_request),
+                                        maximum_wasm_fuel_per_block: maximum_wasm_fuel_per_block
+                                            .unwrap_or(existing_policy.maximum_wasm_fuel_per_block),
+                                        maximum_evm_fuel_per_block: maximum_evm_fuel_per_block
+                                            .unwrap_or(existing_policy.maximum_evm_fuel_per_block),
+                                        maximum_service_oracle_execution_ms:
+                                            maximum_service_oracle_execution_ms.unwrap_or(
+                                                existing_policy.maximum_service_oracle_execution_ms,
+                                            ),
+                                        maximum_block_size: maximum_block_size
+                                            .unwrap_or(existing_policy.maximum_block_size),
+                                        maximum_bytecode_size: maximum_bytecode_size
+                                            .unwrap_or(existing_policy.maximum_bytecode_size),
+                                        maximum_blob_size: maximum_blob_size
+                                            .unwrap_or(existing_policy.maximum_blob_size),
+                                        maximum_published_blobs: maximum_published_blobs
+                                            .unwrap_or(existing_policy.maximum_published_blobs),
+                                        maximum_block_proposal_size: maximum_block_proposal_size
+                                            .unwrap_or(existing_policy.maximum_block_proposal_size),
+                                        maximum_bytes_read_per_block: maximum_bytes_read_per_block
+                                            .unwrap_or(
+                                                existing_policy.maximum_bytes_read_per_block,
+                                            ),
+                                        maximum_bytes_written_per_block:
+                                            maximum_bytes_written_per_block.unwrap_or(
+                                                existing_policy.maximum_bytes_written_per_block,
+                                            ),
+                                        maximum_oracle_response_bytes:
+                                            maximum_oracle_response_bytes.unwrap_or(
+                                                existing_policy.maximum_oracle_response_bytes,
+                                            ),
+                                        maximum_http_response_bytes: maximum_http_response_bytes
+                                            .unwrap_or(existing_policy.maximum_http_response_bytes),
+                                        http_request_timeout_ms: http_request_timeout_ms
+                                            .unwrap_or(existing_policy.http_request_timeout_ms),
+                                        http_request_allow_list: http_request_allow_list
+                                            .map(BTreeSet::from_iter)
+                                            .unwrap_or(existing_policy.http_request_allow_list),
+                                    };
                                     info!("{policy}");
                                     if committee.policy() == &policy {
                                         return Ok(ClientOutcome::Committed(None));
@@ -716,9 +757,16 @@ impl Runnable for Job {
             FinalizeCommittee => {
                 info!("Starting operations to remove old committees");
                 let time_start = Instant::now();
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
 
-                let chain_client =
-                    context.make_chain_client(context.wallet.genesis_admin_chain())?;
+                let chain_client = context
+                    .make_chain_client(context.wallet.genesis_admin_chain())
+                    .await?;
 
                 // Remove the old committee.
                 info!("Finalizing current committee");
@@ -740,114 +788,101 @@ impl Runnable for Job {
 
             #[cfg(feature = "benchmark")]
             Benchmark {
-                max_in_flight,
                 num_chains,
                 tokens_per_chain,
                 transactions_per_block,
                 fungible_application_id,
+                bps,
+                close_chains,
+                health_check_endpoints,
+                wrap_up_max_in_flight,
+                confirm_before_start,
             } => {
-                // Below all block proposals are supposed to succeed without retries, we
-                // must make sure that all incoming payments have been accepted on-chain
-                // and that no validator is missing user certificates.
-                context.process_inboxes_and_force_validator_updates().await;
+                let pub_keys: Vec<_> = std::iter::repeat_with(|| signer.generate_new())
+                    .take(num_chains)
+                    .collect();
+                signer.persist().await?;
 
-                let key_pairs = context
-                    .make_benchmark_chains(num_chains, tokens_per_chain)
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
+                assert!(num_chains > 0, "Number of chains must be greater than 0");
+                assert!(
+                    transactions_per_block > 0,
+                    "Number of transactions per block must be greater than 0"
+                );
+                if let Some(bps) = bps {
+                    assert!(bps > 0, "BPS must be greater than 0");
+                    assert!(
+                        bps >= num_chains,
+                        "BPS must be greater than or equal to the number of chains"
+                    );
+                }
+
+                let (chain_clients, epoch, blocks_infos, committee) = context
+                    .prepare_for_benchmark(
+                        num_chains,
+                        transactions_per_block,
+                        tokens_per_chain,
+                        fungible_application_id,
+                        pub_keys,
+                    )
                     .await?;
 
-                if let Some(id) = fungible_application_id {
-                    context
-                        .supply_fungible_tokens(&key_pairs, id, max_in_flight)
-                        .await?;
-                }
-
-                // For this command, we create proposals and gather certificates without using
-                // the client library. We update the wallet storage at the end using a local node.
-                info!("Starting benchmark phase 1 (block proposals)");
-                let proposals = context.make_benchmark_block_proposals(
-                    &key_pairs,
-                    transactions_per_block,
-                    fungible_application_id,
-                );
-                let num_proposal = proposals.len();
-                let mut values = HashMap::new();
-
-                for rpc_msg in &proposals {
-                    if let RpcMessage::BlockProposal(proposal) = rpc_msg {
-                        let executed_block = context
-                            .stage_block_execution(proposal.content.proposal.clone())
+                if confirm_before_start {
+                    info!("Ready to start benchmark. Say 'yes' when you want to proceed. Only 'yes' will be accepted");
+                    if !std::io::stdin()
+                        .lines()
+                        .next()
+                        .unwrap()?
+                        .eq_ignore_ascii_case("yes")
+                    {
+                        info!("Benchmark cancelled by user");
+                        context
+                            .wrap_up_benchmark(chain_clients, close_chains, wrap_up_max_in_flight)
                             .await?;
-                        let value = Hashed::new(ConfirmedBlock::new(executed_block));
-                        values.insert(value.hash(), value);
+                        return Ok(());
                     }
                 }
 
-                let responses = context
-                    .mass_broadcast("block proposals", max_in_flight, proposals)
-                    .await;
-                let votes = responses
-                    .into_iter()
-                    .filter_map(|message| {
-                        let response = deserialize_response(message)?;
-                        let vote = response.info.manager.pending?;
-                        let value = values.get(&vote.value.value_hash)?.clone();
-                        vote.clone().with_value(value)
-                    })
-                    .collect::<Vec<_>>();
-                info!("Received {} valid votes.", votes.len());
+                linera_client::benchmark::Benchmark::run_benchmark(
+                    num_chains,
+                    transactions_per_block,
+                    bps,
+                    chain_clients.clone(),
+                    epoch,
+                    blocks_infos,
+                    committee,
+                    context.client.local_node().clone(),
+                    health_check_endpoints,
+                )
+                .await?;
 
-                info!("Starting benchmark phase 2 (certified blocks)");
-                let certificates = context.make_benchmark_certificates_from_votes(votes);
-                assert_eq!(
-                    num_proposal,
-                    certificates.len(),
-                    "Unable to build all the expected certificates from received votes"
-                );
-                let messages = certificates
-                    .iter()
-                    .map(|certificate| {
-                        RpcMessage::ConfirmedCertificate(Box::new(
-                            HandleConfirmedCertificateRequest {
-                                certificate: certificate.clone(),
-                                wait_for_outgoing_messages: true,
-                            },
-                        ))
-                    })
-                    .collect();
-                let responses = context
-                    .mass_broadcast("certificates", max_in_flight, messages)
-                    .await;
-                let mut confirmed = HashSet::new();
-                let num_valid = responses.into_iter().fold(0, |acc, message| {
-                    match deserialize_response(message) {
-                        Some(response) => {
-                            confirmed.insert(response.info.chain_id);
-                            acc + 1
-                        }
-                        None => acc,
-                    }
-                });
-                info!(
-                    "Confirmed {} valid certificates for {} block proposals.",
-                    num_valid,
-                    confirmed.len()
-                );
-
-                info!("Updating local state of user chains");
-                context.update_wallet_from_certificates(certificates).await;
-                context.save_wallet().await?;
+                context
+                    .wrap_up_benchmark(chain_clients, close_chains, wrap_up_max_in_flight)
+                    .await?;
             }
 
             Watch { chain_id, raw } => {
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
+
                 let mut join_set = JoinSet::new();
                 let chain_id = chain_id.unwrap_or_else(|| context.default_chain());
-                let chain_client = context.make_chain_client(chain_id)?;
+                let chain_client = context.make_chain_client(chain_id).await?;
                 info!("Watching for notifications for chain {:?}", chain_id);
                 let (listener, _listen_handle, mut notifications) = chain_client.listen().await?;
                 join_set.spawn_task(listener);
                 while let Some(notification) = notifications.next().await {
                     if let Reason::NewBlock { .. } = notification.reason {
-                        context.update_and_save_wallet(&chain_client).await?;
+                        context.update_wallet_from_client(&chain_client).await?;
                     }
                     if raw {
                         println!("{}", serde_json::to_string(&notification)?);
@@ -857,9 +892,19 @@ impl Runnable for Job {
             }
 
             Service { config, port } => {
+                let context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
+
                 let default_chain = context.wallet().default_chain();
-                let service = NodeService::new(config, port, default_chain, storage, context).await;
-                service.run().await?;
+                let service = NodeService::new(config, port, default_chain, context).await;
+                let cancellation_token = CancellationToken::new();
+                let child_token = cancellation_token.child_token();
+                tokio::spawn(listen_for_shutdown_signals(cancellation_token));
+                service.run(child_token).await?;
             }
 
             Faucet {
@@ -869,6 +914,13 @@ impl Runnable for Job {
                 limit_rate_until,
                 config,
             } => {
+                let context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
+
                 let chain_id = chain_id.unwrap_or_else(|| context.default_chain());
                 info!("Starting faucet service using chain {}", chain_id);
                 let end_timestamp = limit_rate_until
@@ -890,24 +942,35 @@ impl Runnable for Job {
                     storage,
                 )
                 .await?;
-                faucet.run().await?;
+                let cancellation_token = CancellationToken::new();
+                let child_token = cancellation_token.child_token();
+                tokio::spawn(listen_for_shutdown_signals(cancellation_token));
+                faucet.run(child_token).await?;
             }
 
-            PublishBytecode {
+            PublishModule {
                 contract,
                 service,
+                vm_runtime,
                 publisher,
             } => {
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
+
                 let start_time = Instant::now();
                 let publisher = publisher.unwrap_or_else(|| context.default_chain());
-                info!("Publishing bytecode on chain {}", publisher);
-                let chain_client = context.make_chain_client(publisher)?;
-                let bytecode_id = context
-                    .publish_bytecode(&chain_client, contract, service)
+                info!("Publishing module on chain {}", publisher);
+                let chain_client = context.make_chain_client(publisher).await?;
+                let module_id = context
+                    .publish_module(&chain_client, contract, service, vm_runtime)
                     .await?;
-                println!("{}", bytecode_id);
+                println!("{}", module_id);
                 info!(
-                    "Bytecode published in {} ms",
+                    "Module published in {} ms",
                     start_time.elapsed().as_millis()
                 );
             }
@@ -916,10 +979,17 @@ impl Runnable for Job {
                 blob_path,
                 publisher,
             } => {
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
+
                 let start_time = Instant::now();
                 let publisher = publisher.unwrap_or_else(|| context.default_chain());
                 info!("Publishing data blob on chain {}", publisher);
-                let chain_client = context.make_chain_client(publisher)?;
+                let chain_client = context.make_chain_client(publisher).await?;
                 let hash = context.publish_data_blob(&chain_client, blob_path).await?;
                 println!("{}", hash);
                 info!(
@@ -930,16 +1000,23 @@ impl Runnable for Job {
 
             // TODO(#2490): Consider removing or renaming this.
             ReadDataBlob { hash, reader } => {
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
+
                 let start_time = Instant::now();
                 let reader = reader.unwrap_or_else(|| context.default_chain());
                 info!("Verifying data blob on chain {}", reader);
-                let chain_client = context.make_chain_client(reader)?;
+                let chain_client = context.make_chain_client(reader).await?;
                 context.read_data_blob(&chain_client, hash).await?;
                 info!("Data blob read in {} ms", start_time.elapsed().as_millis());
             }
 
             CreateApplication {
-                bytecode_id,
+                module_id,
                 creator,
                 json_parameters,
                 json_parameters_path,
@@ -947,10 +1024,17 @@ impl Runnable for Job {
                 json_argument_path,
                 required_application_ids,
             } => {
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
+
                 let start_time = Instant::now();
                 let creator = creator.unwrap_or_else(|| context.default_chain());
                 info!("Creating application on chain {}", creator);
-                let chain_client = context.make_chain_client(creator)?;
+                let chain_client = context.make_chain_client(creator).await?;
                 let parameters = read_json(json_parameters, json_parameters_path)?;
                 let argument = read_json(json_argument, json_argument_path)?;
 
@@ -967,7 +1051,7 @@ impl Runnable for Job {
                         async move {
                             chain_client
                                 .create_application_untyped(
-                                    bytecode_id,
+                                    module_id,
                                     parameters,
                                     argument,
                                     required_application_ids.unwrap_or_default(),
@@ -988,6 +1072,7 @@ impl Runnable for Job {
             PublishAndCreate {
                 contract,
                 service,
+                vm_runtime,
                 publisher,
                 json_parameters,
                 json_parameters_path,
@@ -995,15 +1080,21 @@ impl Runnable for Job {
                 json_argument_path,
                 required_application_ids,
             } => {
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
+
                 let start_time = Instant::now();
                 let publisher = publisher.unwrap_or_else(|| context.default_chain());
                 info!("Publishing and creating application on chain {}", publisher);
-                let chain_client = context.make_chain_client(publisher)?;
+                let chain_client = context.make_chain_client(publisher).await?;
                 let parameters = read_json(json_parameters, json_parameters_path)?;
                 let argument = read_json(json_argument, json_argument_path)?;
-
-                let bytecode_id = context
-                    .publish_bytecode(&chain_client, contract, service)
+                let module_id = context
+                    .publish_module(&chain_client, contract, service, vm_runtime)
                     .await?;
 
                 let (application_id, _) = context
@@ -1015,7 +1106,7 @@ impl Runnable for Job {
                         async move {
                             chain_client
                                 .create_application_untyped(
-                                    bytecode_id,
+                                    module_id,
                                     parameters,
                                     argument,
                                     required_application_ids.unwrap_or_default(),
@@ -1033,51 +1124,19 @@ impl Runnable for Job {
                 println!("{}", application_id);
             }
 
-            RequestApplication {
-                application_id,
-                target_chain_id,
-                requester_chain_id,
-            } => {
-                let start_time = Instant::now();
-                let requester_chain_id =
-                    requester_chain_id.unwrap_or_else(|| context.default_chain());
-                info!("Requesting application for chain {}", requester_chain_id);
-                let chain_client = context.make_chain_client(requester_chain_id)?;
-                let certificate = context
-                    .apply_client_command(&chain_client, |chain_client| {
-                        let chain_client = chain_client.clone();
-                        async move {
-                            chain_client
-                                .request_application(application_id, target_chain_id)
-                                .await
-                        }
-                    })
-                    .await
-                    .context("Failed to request application")?;
-                info!(
-                    "Application requested in {} ms",
-                    start_time.elapsed().as_millis()
+            Assign { owner, chain_id } => {
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
                 );
-                debug!("{:?}", certificate);
-            }
-
-            Assign { owner, message_id } => {
                 let start_time = Instant::now();
-                let chain_id = ChainId::child(message_id);
                 info!(
                     "Linking chain {chain_id} to its corresponding key in the wallet, owned by \
                     {owner}",
                 );
-                Self::assign_new_chain_to_key(
-                    chain_id,
-                    message_id,
-                    storage,
-                    owner,
-                    None,
-                    &mut context,
-                )
-                .await?;
-                println!("{}", chain_id);
+                context.assign_new_chain_to_key(chain_id, owner).await?;
                 context.save_wallet().await?;
                 info!(
                     "Chain linked to owner in {} ms",
@@ -1089,6 +1148,7 @@ impl Runnable for Job {
                 ProjectCommand::PublishAndCreate {
                     path,
                     name,
+                    vm_runtime,
                     publisher,
                     json_parameters,
                     json_parameters_path,
@@ -1096,10 +1156,16 @@ impl Runnable for Job {
                     json_argument_path,
                     required_application_ids,
                 } => {
+                    let mut context = ClientContext::new(
+                        storage.clone(),
+                        options.inner.clone(),
+                        wallet,
+                        Box::new(signer.into_value()),
+                    );
                     let start_time = Instant::now();
                     let publisher = publisher.unwrap_or_else(|| context.default_chain());
                     info!("Creating application on chain {}", publisher);
-                    let chain_client = context.make_chain_client(publisher)?;
+                    let chain_client = context.make_chain_client(publisher).await?;
 
                     let parameters = read_json(json_parameters, json_parameters_path)?;
                     let argument = read_json(json_argument, json_argument_path)?;
@@ -1108,8 +1174,8 @@ impl Runnable for Job {
                     let project = project::Project::from_existing_project(project_path)?;
                     let (contract_path, service_path) = project.build(name)?;
 
-                    let bytecode_id = context
-                        .publish_bytecode(&chain_client, contract_path, service_path)
+                    let module_id = context
+                        .publish_module(&chain_client, contract_path, service_path, vm_runtime)
                         .await?;
 
                     let (application_id, _) = context
@@ -1121,7 +1187,7 @@ impl Runnable for Job {
                             async move {
                                 chain_client
                                     .create_application_untyped(
-                                        bytecode_id,
+                                        module_id,
                                         parameters,
                                         argument,
                                         required_application_ids.unwrap_or_default(),
@@ -1142,10 +1208,16 @@ impl Runnable for Job {
             },
 
             RetryPendingBlock { chain_id } => {
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
                 let start_time = Instant::now();
                 let chain_id = chain_id.unwrap_or_else(|| context.default_chain());
                 info!("Committing pending block for chain {}", chain_id);
-                let chain_client = context.make_chain_client(chain_id)?;
+                let chain_client = context.make_chain_client(chain_id).await?;
                 match chain_client.process_pending_block().await? {
                     ClientOutcome::Committed(Some(certificate)) => {
                         info!("Pending block committed successfully.");
@@ -1156,7 +1228,7 @@ impl Runnable for Job {
                         info!("Please try again at {}", timeout.timestamp)
                     }
                 }
-                context.update_and_save_wallet(&chain_client).await?;
+                context.update_wallet_from_client(&chain_client).await?;
                 info!(
                     "Pending block retried in {} ms",
                     start_time.elapsed().as_millis()
@@ -1170,31 +1242,26 @@ impl Runnable for Job {
                 ..
             }) => {
                 let start_time = Instant::now();
-                let key_pair = context.wallet.generate_key_pair();
-                let owner = key_pair.public().into();
+                let public_key = signer.mutate(|s| s.generate_new()).await?;
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
+                let owner: AccountOwner = public_key.into();
                 info!(
                     "Requesting a new chain for owner {owner} using the faucet at address \
                     {faucet_url}",
                 );
-                context
-                    .wallet_mut()
-                    .mutate(|w| w.add_unassigned_key_pair(key_pair))
-                    .await?;
                 let faucet = cli_wrappers::Faucet::new(faucet_url);
                 let outcome = faucet.claim(&owner).await?;
-                let validators = faucet.current_validators().await?;
                 println!("{}", outcome.chain_id);
-                println!("{}", outcome.message_id);
                 println!("{}", outcome.certificate_hash);
-                Self::assign_new_chain_to_key(
-                    outcome.chain_id,
-                    outcome.message_id,
-                    storage.clone(),
-                    owner,
-                    Some(validators),
-                    &mut context,
-                )
-                .await?;
+                println!("{}", owner);
+                context
+                    .assign_new_chain_to_key(outcome.chain_id, owner)
+                    .await?;
                 let admin_id = context.wallet().genesis_admin_chain();
                 let chains = with_other_chains
                     .into_iter()
@@ -1206,6 +1273,43 @@ impl Runnable for Job {
                     .await??;
                 info!(
                     "Wallet initialized in {} ms",
+                    start_time.elapsed().as_millis()
+                );
+            }
+
+            Wallet(WalletCommand::RequestChain {
+                faucet: faucet_url,
+                set_default,
+            }) => {
+                let start_time = Instant::now();
+                let public_key = signer.mutate(|s| s.generate_new()).await?;
+                let mut context = ClientContext::new(
+                    storage.clone(),
+                    options.inner.clone(),
+                    wallet,
+                    Box::new(signer.into_value()),
+                );
+                let owner = public_key.into();
+                info!(
+                    "Requesting a new chain for owner {owner} using the faucet at address \
+                    {faucet_url}",
+                );
+                let faucet = cli_wrappers::Faucet::new(faucet_url);
+                let outcome = faucet.claim(&owner).await?;
+                println!("{}", outcome.chain_id);
+                println!("{}", outcome.certificate_hash);
+                println!("{}", owner);
+                context
+                    .assign_new_chain_to_key(outcome.chain_id, owner)
+                    .await?;
+                if set_default {
+                    context
+                        .wallet_mut()
+                        .mutate(|w| w.set_default_chain(outcome.chain_id))
+                        .await??;
+                }
+                info!(
+                    "New chain requested and added in {} ms",
                     start_time.elapsed().as_millis()
                 );
             }
@@ -1225,94 +1329,13 @@ impl Runnable for Job {
 }
 
 impl Job {
-    async fn assign_new_chain_to_key<S>(
-        chain_id: ChainId,
-        message_id: MessageId,
-        storage: S,
-        owner: Owner,
-        validators: Option<Vec<(ValidatorName, String)>>,
-        context: &mut ClientContext<S, impl Persist<Target = Wallet>>,
-    ) -> anyhow::Result<()>
-    where
-        S: Storage + Clone + Send + Sync + 'static,
-    {
-        let node_provider = context.make_node_provider();
-        let client = client::Client::new(
-            node_provider.clone(),
-            storage,
-            100,
-            CrossChainMessageDelivery::Blocking,
-            false,
-            vec![message_id.chain_id, chain_id],
-            "Temporary client for fetching the parent chain",
-            NonZeroUsize::new(20).expect("Chain worker limit should not be zero"),
-            DEFAULT_GRACE_PERIOD,
-        );
-
-        // Take the latest committee we know of.
-        let admin_chain_id = context.wallet.genesis_admin_chain();
-        let query = ChainInfoQuery::new(admin_chain_id).with_committees();
-        let nodes: Vec<_> = if let Some(validators) = validators {
-            node_provider
-                .make_nodes_from_list(validators)?
-                .map(|(name, node)| RemoteNode { name, node })
-                .collect()
-        } else {
-            let info = client.local_node().handle_chain_info_query(query).await?;
-            let committee = info
-                .latest_committee()
-                .context("Invalid chain info response; missing latest committee")?;
-            node_provider
-                .make_nodes(committee)?
-                .map(|(name, node)| RemoteNode { name, node })
-                .collect()
-        };
-
-        // Download the parent chain.
-        let target_height = message_id.height.try_add_one()?;
-        client
-            .download_certificates(&nodes, message_id.chain_id, target_height)
-            .await
-            .context("Failed to download parent chain")?;
-
-        // The initial timestamp for the new chain is taken from the block with the message.
-        let certificate = client
-            .local_node()
-            .certificate_for(&message_id)
-            .await
-            .context("could not find OpenChain message")?;
-        let executed_block = certificate.block();
-        let Some(Message::System(SystemMessage::OpenChain(config))) = executed_block
-            .message_by_id(&message_id)
-            .map(|msg| &msg.message)
-        else {
-            bail!(
-                "The message with the ID returned by the faucet is not OpenChain. \
-                Please make sure you are connecting to a genuine faucet."
-            );
-        };
-        anyhow::ensure!(
-            config.ownership.verify_owner(&owner),
-            "The chain with the ID returned by the faucet is not owned by you. \
-            Please make sure you are connecting to a genuine faucet."
-        );
-        context
-            .wallet_mut()
-            .mutate(|w| {
-                w.assign_new_chain_to_owner(owner, chain_id, executed_block.header.timestamp)
-            })
-            .await?
-            .context("could not assign the new chain")?;
-        Ok(())
-    }
-
     /// Prints a warning message to explain that the wallet has been initialized using data from
     /// untrusted nodes, and gives instructions to verify that we are connected to the right
     /// network.
     async fn print_peg_certificate_hash<S>(
         storage: S,
         chain_ids: impl IntoIterator<Item = ChainId>,
-        context: &ClientContext<S, impl Persist<Target = Wallet>>,
+        context: &ClientContext<impl linera_core::Environment, impl Persist<Target = Wallet>>,
     ) -> anyhow::Result<()>
     where
         S: Storage + Clone + Send + Sync + 'static,
@@ -1366,10 +1389,320 @@ impl Job {
     }
 }
 
-fn main() -> anyhow::Result<()> {
-    let options = ClientOptions::init()?;
+#[derive(Clone, clap::Parser)]
+#[command(
+    name = "linera",
+    version = linera_version::VersionInfo::default_clap_str(),
+    about = "A Byzantine-fault tolerant sidechain with low-latency finality and high throughput",
+)]
+struct ClientOptions {
+    /// Storage configuration for the blockchain history.
+    #[arg(long = "storage", global = true)]
+    storage_config: Option<String>,
 
-    linera_base::tracing::init(&log_file_name_for(&options.command));
+    /// Common options.
+    #[command(flatten)]
+    inner: ClientContextOptions,
+
+    /// The maximal number of simultaneous queries to the database
+    #[arg(long)]
+    max_concurrent_queries: Option<usize>,
+
+    /// The maximal number of simultaneous stream queries to the database
+    #[arg(long, default_value = "10")]
+    max_stream_queries: usize,
+
+    /// The maximal memory used in the storage cache.
+    #[arg(long, default_value = "10000000")]
+    max_cache_size: usize,
+
+    /// The maximal size of an entry in the storage cache.
+    #[arg(long, default_value = "1000000")]
+    max_entry_size: usize,
+
+    /// The maximal number of entries in the storage cache.
+    #[arg(long, default_value = "1000")]
+    max_cache_entries: usize,
+
+    /// The WebAssembly runtime to use.
+    #[arg(long)]
+    wasm_runtime: Option<WasmRuntime>,
+
+    /// The number of Tokio worker threads to use.
+    #[arg(long, env = "LINERA_CLIENT_TOKIO_THREADS")]
+    tokio_threads: Option<usize>,
+
+    /// The number of Tokio blocking threads to use.
+    #[arg(long, env = "LINERA_CLIENT_TOKIO_BLOCKING_THREADS")]
+    tokio_blocking_threads: Option<usize>,
+
+    /// Subcommand.
+    #[command(subcommand)]
+    command: ClientCommand,
+}
+
+impl ClientOptions {
+    fn init() -> Self {
+        <ClientOptions as clap::Parser>::parse()
+    }
+
+    fn common_config(&self) -> CommonStoreConfig {
+        let storage_cache_config = StorageCacheConfig {
+            max_cache_size: self.max_cache_size,
+            max_entry_size: self.max_entry_size,
+            max_cache_entries: self.max_cache_entries,
+        };
+        CommonStoreConfig {
+            max_concurrent_queries: self.max_concurrent_queries,
+            max_stream_queries: self.max_stream_queries,
+            storage_cache_config,
+        }
+    }
+
+    async fn run_with_storage<R: Runnable>(&self, job: R) -> Result<R::Output, Error> {
+        let storage_config = self.storage_config()?;
+        debug!("Running command using storage configuration: {storage_config}");
+        let store_config = storage_config
+            .add_common_config(self.common_config())
+            .await?;
+        let genesis_config = self.wallet().await?.genesis_config().clone();
+        let output = Box::pin(store_config.run_with_storage(
+            &genesis_config,
+            self.wasm_runtime.with_wasm_default(),
+            job,
+        ))
+        .await?;
+        Ok(output)
+    }
+
+    async fn run_with_store<R: RunnableWithStore>(&self, job: R) -> Result<R::Output, Error> {
+        let storage_config = self.storage_config()?;
+        debug!("Running command using storage configuration: {storage_config}");
+        let store_config = storage_config
+            .add_common_config(self.common_config())
+            .await?;
+        let output = Box::pin(store_config.run_with_store(job)).await?;
+        Ok(output)
+    }
+
+    async fn initialize_storage(&self) -> Result<(), Error> {
+        let storage_config = self.storage_config()?;
+        debug!("Initializing storage using configuration: {storage_config}");
+        let store_config = storage_config
+            .add_common_config(self.common_config())
+            .await?;
+        let wallet = self.wallet().await?;
+        store_config.initialize(wallet.genesis_config()).await?;
+        Ok(())
+    }
+
+    async fn wallet(&self) -> Result<WalletState<persistent::File<Wallet>>, Error> {
+        let wallet = persistent::File::read(&self.wallet_path()?)?;
+        Ok(WalletState::new(wallet))
+    }
+
+    async fn signer(&self) -> Result<SignerState<persistent::File<InMemorySigner>>, Error> {
+        let signer = persistent::File::read(&self.keystore_path()?)?;
+        Ok(SignerState::new(signer))
+    }
+
+    fn suffix(&self) -> String {
+        self.inner
+            .with_wallet
+            .as_ref()
+            .map(|x| format!("_{}", x))
+            .unwrap_or_default()
+    }
+
+    fn config_path(&self) -> Result<PathBuf, Error> {
+        let mut config_dir = dirs::config_dir().ok_or(anyhow!(
+            "Default wallet directory is not supported in this platform: please specify storage and wallet paths"
+        ))?;
+        config_dir.push("linera");
+        if !config_dir.exists() {
+            debug!("Creating default wallet directory {}", config_dir.display());
+            fs_err::create_dir(&config_dir)?;
+        }
+        info!("Using default wallet directory {}", config_dir.display());
+        Ok(config_dir)
+    }
+
+    fn storage_config(&self) -> Result<StorageConfigNamespace, Error> {
+        if let Some(config) = &self.storage_config {
+            return config.parse();
+        }
+        let suffix = self.suffix();
+        let storage_env_var = env::var(format!("LINERA_STORAGE{suffix}")).ok();
+        if let Some(config) = storage_env_var {
+            return config.parse();
+        }
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "rocksdb")] {
+                let spawn_mode =
+                    linera_views::rocks_db::RocksDbSpawnMode::get_spawn_mode_from_runtime();
+                let storage_config = linera_service::storage::StorageConfig::RocksDb {
+                    path: self.config_path()?.join("wallet.db"),
+                    spawn_mode,
+                };
+                let namespace = "default".to_string();
+                Ok(StorageConfigNamespace {
+                    storage_config,
+                    namespace,
+                })
+            } else {
+                bail!("Cannot apply default storage because the feature 'rocksdb' was not selected");
+            }
+        }
+    }
+
+    fn wallet_path(&self) -> Result<PathBuf, Error> {
+        if let Some(path) = &self.inner.wallet_state_path {
+            return Ok(path.clone());
+        }
+        let suffix = self.suffix();
+        let wallet_env_var = env::var(format!("LINERA_WALLET{suffix}")).ok();
+        if let Some(path) = wallet_env_var {
+            return Ok(path.parse()?);
+        }
+        let config_path = self.config_path()?;
+        Ok(config_path.join("wallet.json"))
+    }
+
+    fn keystore_path(&self) -> Result<PathBuf, Error> {
+        if let Some(path) = &self.inner.keystore_path {
+            return Ok(path.clone());
+        }
+        let suffix = self.suffix();
+        let keystore_env_var = env::var(format!("LINERA_KEYSTORE{suffix}")).ok();
+        if let Some(path) = keystore_env_var {
+            return Ok(path.parse()?);
+        }
+        let config_path = self.config_path()?;
+        Ok(config_path.join("keystore.json"))
+    }
+
+    pub fn create_wallet(
+        &self,
+        genesis_config: GenesisConfig,
+    ) -> Result<WalletState<persistent::File<Wallet>>, Error> {
+        let wallet_path = self.wallet_path()?;
+        if wallet_path.exists() {
+            bail!("Wallet already exists: {}", wallet_path.display());
+        }
+        let wallet_state = WalletState::read_or_create(&wallet_path, Wallet::new(genesis_config))?;
+        Ok(wallet_state)
+    }
+
+    pub fn create_keystore(
+        &self,
+        testing_prng_seed: Option<u64>,
+    ) -> Result<SignerState<persistent::File<InMemorySigner>>, Error> {
+        let keystore_path = self.keystore_path()?;
+        if keystore_path.exists() {
+            bail!("Keystore already exists: {}", keystore_path.display());
+        }
+        let signer_state =
+            SignerState::read_or_create(&keystore_path, InMemorySigner::new(testing_prng_seed))?;
+        Ok(signer_state)
+    }
+}
+
+struct DatabaseToolJob<'a>(&'a DatabaseToolCommand);
+
+#[async_trait]
+impl RunnableWithStore for DatabaseToolJob<'_> {
+    type Output = i32;
+
+    async fn run<S>(
+        self,
+        config: S::Config,
+        namespace: String,
+    ) -> Result<Self::Output, anyhow::Error>
+    where
+        S: KeyValueStore + Clone + Send + Sync + 'static,
+        S::Error: Send + Sync,
+    {
+        let start_time = Instant::now();
+        match self.0 {
+            DatabaseToolCommand::DeleteAll => {
+                S::delete_all(&config).await?;
+                info!(
+                    "All namespaces deleted in {} ms",
+                    start_time.elapsed().as_millis()
+                );
+            }
+            DatabaseToolCommand::DeleteNamespace => {
+                S::delete(&config, &namespace).await?;
+                info!(
+                    "Namespace {namespace} deleted in {} ms",
+                    start_time.elapsed().as_millis()
+                );
+            }
+            DatabaseToolCommand::CheckExistence => {
+                let test = S::exists(&config, &namespace).await?;
+                info!(
+                    "Existence of a namespace {namespace} checked in {} ms",
+                    start_time.elapsed().as_millis()
+                );
+                if test {
+                    info!("The namespace {namespace} does exist in storage");
+                    return Ok(0);
+                } else {
+                    info!("The namespace {namespace} does not exist in storage");
+                    return Ok(1);
+                }
+            }
+            DatabaseToolCommand::Initialize {
+                genesis_config_path,
+            } => {
+                let genesis_config: GenesisConfig = util::read_json(genesis_config_path)?;
+                let mut storage =
+                    DbStorage::<S, _>::maybe_create_and_connect(&config, &namespace, None).await?;
+                genesis_config.initialize_storage(&mut storage).await?;
+                info!(
+                    "Namespace {namespace} was initialized in {} ms",
+                    start_time.elapsed().as_millis()
+                );
+            }
+            DatabaseToolCommand::ListNamespaces => {
+                let namespaces = S::list_all(&config).await?;
+                info!(
+                    "Namespaces listed in {} ms",
+                    start_time.elapsed().as_millis()
+                );
+                info!("The list of namespaces is:");
+                for namespace in namespaces {
+                    println!("{}", namespace);
+                }
+            }
+            DatabaseToolCommand::ListBlobIds => {
+                let blob_ids = DbStorage::<S, _>::list_blob_ids(&config, &namespace).await?;
+                info!("Blob IDs listed in {} ms", start_time.elapsed().as_millis());
+                info!("The list of blob IDs is:");
+                for id in blob_ids {
+                    println!("{}", id);
+                }
+            }
+            DatabaseToolCommand::ListChainIds => {
+                let chain_ids = DbStorage::<S, _>::list_chain_ids(&config, &namespace).await?;
+                info!(
+                    "Chain IDs listed in {} ms",
+                    start_time.elapsed().as_millis()
+                );
+                info!("The list of chain IDs is:");
+                for id in chain_ids {
+                    println!("{}", id);
+                }
+            }
+        }
+        Ok(0)
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    let options = ClientOptions::init();
+
+    linera_base::tracing::init(&options.command.log_file_name());
 
     let mut runtime = if options.tokio_threads == Some(1) {
         tokio::runtime::Builder::new_current_thread()
@@ -1383,8 +1716,12 @@ fn main() -> anyhow::Result<()> {
         builder
     };
 
+    if let Some(blocking_threads) = options.tokio_blocking_threads {
+        runtime.max_blocking_threads(blocking_threads);
+    }
+
     let span = tracing::info_span!("linera::main");
-    if let Some(wallet_id) = options.with_wallet {
+    if let Some(wallet_id) = &options.inner.with_wallet {
         span.record("wallet_id", wallet_id);
     }
 
@@ -1397,59 +1734,14 @@ fn main() -> anyhow::Result<()> {
     let error_code = match result {
         Ok(code) => code,
         Err(msg) => {
-            tracing::error!("Error is {:?}", msg);
+            error!("Error is {:?}", msg);
             2
         }
     };
     process::exit(error_code);
 }
 
-/// Returns the log file name to use based on the [`ClientCommand`] that will run.
-fn log_file_name_for(command: &ClientCommand) -> Cow<'static, str> {
-    match command {
-        ClientCommand::Transfer { .. }
-        | ClientCommand::OpenChain { .. }
-        | ClientCommand::OpenMultiOwnerChain { .. }
-        | ClientCommand::ChangeOwnership { .. }
-        | ClientCommand::ChangeApplicationPermissions { .. }
-        | ClientCommand::CloseChain { .. }
-        | ClientCommand::LocalBalance { .. }
-        | ClientCommand::QueryBalance { .. }
-        | ClientCommand::SyncBalance { .. }
-        | ClientCommand::Sync { .. }
-        | ClientCommand::ProcessInbox { .. }
-        | ClientCommand::QueryValidator { .. }
-        | ClientCommand::QueryValidators { .. }
-        | ClientCommand::SetValidator { .. }
-        | ClientCommand::RemoveValidator { .. }
-        | ClientCommand::ResourceControlPolicy { .. }
-        | ClientCommand::FinalizeCommittee
-        | ClientCommand::CreateGenesisConfig { .. }
-        | ClientCommand::PublishBytecode { .. }
-        | ClientCommand::PublishDataBlob { .. }
-        | ClientCommand::ReadDataBlob { .. }
-        | ClientCommand::CreateApplication { .. }
-        | ClientCommand::PublishAndCreate { .. }
-        | ClientCommand::RequestApplication { .. }
-        | ClientCommand::Keygen { .. }
-        | ClientCommand::Assign { .. }
-        | ClientCommand::Wallet { .. }
-        | ClientCommand::RetryPendingBlock { .. } => "client".into(),
-        #[cfg(feature = "benchmark")]
-        ClientCommand::Benchmark { .. } => "benchmark".into(),
-        ClientCommand::Net { .. } => "net".into(),
-        ClientCommand::Project { .. } => "project".into(),
-        ClientCommand::Watch { .. } => "watch".into(),
-        ClientCommand::Storage { .. } => "storage".into(),
-        ClientCommand::Service { port, .. } => format!("service-{port}").into(),
-        ClientCommand::Faucet { .. } => "faucet".into(),
-        ClientCommand::HelpMarkdown | ClientCommand::ExtractScriptFromMarkdown { .. } => {
-            "tool".into()
-        }
-    }
-}
-
-async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
+async fn run(options: &ClientOptions) -> Result<i32, Error> {
     match &options.command {
         ClientCommand::HelpMarkdown => {
             clap_markdown::print_help_markdown::<ClientOptions>();
@@ -1481,57 +1773,96 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
             initial_funding,
             start_timestamp,
             num_other_initial_chains,
+            policy_config,
             block_price,
-            fuel_unit_price,
+            wasm_fuel_unit_price,
+            evm_fuel_unit_price,
             read_operation_price,
             write_operation_price,
             byte_read_price,
             byte_written_price,
             byte_stored_price,
+            blob_read_price,
+            blob_published_price,
+            blob_byte_read_price,
+            blob_byte_published_price,
             operation_price,
             operation_byte_price,
             message_price,
             message_byte_price,
-            maximum_fuel_per_block,
-            maximum_executed_block_size,
+            service_as_oracle_query_price,
+            http_request_price,
+            maximum_wasm_fuel_per_block,
+            maximum_evm_fuel_per_block,
+            maximum_service_oracle_execution_ms,
+            maximum_block_size,
             maximum_blob_size,
+            maximum_published_blobs,
             maximum_bytecode_size,
             maximum_block_proposal_size,
             maximum_bytes_read_per_block,
             maximum_bytes_written_per_block,
+            maximum_oracle_response_bytes,
+            maximum_http_response_bytes,
+            http_request_timeout_ms,
+            http_request_allow_list,
             testing_prng_seed,
             network_name,
         } => {
             let start_time = Instant::now();
             let committee_config: CommitteeConfig = util::read_json(committee_config_path)
                 .expect("Unable to read committee config file");
-            let maximum_fuel_per_block = maximum_fuel_per_block.unwrap_or(u64::MAX);
-            let maximum_bytes_read_per_block = maximum_bytes_read_per_block.unwrap_or(u64::MAX);
-            let maximum_bytes_written_per_block =
-                maximum_bytes_written_per_block.unwrap_or(u64::MAX);
-            let maximum_executed_block_size = maximum_executed_block_size.unwrap_or(u64::MAX);
-            let maximum_blob_size = maximum_blob_size.unwrap_or(u64::MAX);
-            let maximum_bytecode_size = maximum_bytecode_size.unwrap_or(u64::MAX);
-            let maximum_block_proposal_size = maximum_block_proposal_size.unwrap_or(u64::MAX);
-            let policy = ResourceControlPolicy {
-                block: *block_price,
-                fuel_unit: *fuel_unit_price,
-                read_operation: *read_operation_price,
-                write_operation: *write_operation_price,
-                byte_read: *byte_read_price,
-                byte_written: *byte_written_price,
-                byte_stored: *byte_stored_price,
-                operation_byte: *operation_byte_price,
-                operation: *operation_price,
-                message_byte: *message_byte_price,
-                message: *message_price,
-                maximum_fuel_per_block,
-                maximum_executed_block_size,
-                maximum_blob_size,
-                maximum_bytecode_size,
-                maximum_block_proposal_size,
-                maximum_bytes_read_per_block,
-                maximum_bytes_written_per_block,
+            let existing_policy = policy_config.into_policy();
+            let policy = linera_execution::ResourceControlPolicy {
+                block: block_price.unwrap_or(existing_policy.block),
+                wasm_fuel_unit: wasm_fuel_unit_price.unwrap_or(existing_policy.wasm_fuel_unit),
+                evm_fuel_unit: evm_fuel_unit_price.unwrap_or(existing_policy.evm_fuel_unit),
+                read_operation: read_operation_price.unwrap_or(existing_policy.read_operation),
+                write_operation: write_operation_price.unwrap_or(existing_policy.write_operation),
+                byte_read: byte_read_price.unwrap_or(existing_policy.byte_read),
+                byte_written: byte_written_price.unwrap_or(existing_policy.byte_written),
+                blob_read: blob_read_price.unwrap_or(existing_policy.blob_read),
+                blob_published: blob_published_price.unwrap_or(existing_policy.blob_published),
+                blob_byte_read: blob_byte_read_price.unwrap_or(existing_policy.blob_byte_read),
+                blob_byte_published: blob_byte_published_price
+                    .unwrap_or(existing_policy.blob_byte_published),
+                byte_stored: byte_stored_price.unwrap_or(existing_policy.byte_stored),
+                operation: operation_price.unwrap_or(existing_policy.operation),
+                operation_byte: operation_byte_price.unwrap_or(existing_policy.operation_byte),
+                message: message_price.unwrap_or(existing_policy.message),
+                message_byte: message_byte_price.unwrap_or(existing_policy.message_byte),
+                service_as_oracle_query: service_as_oracle_query_price
+                    .unwrap_or(existing_policy.service_as_oracle_query),
+                http_request: http_request_price.unwrap_or(existing_policy.http_request),
+                maximum_wasm_fuel_per_block: maximum_wasm_fuel_per_block
+                    .unwrap_or(existing_policy.maximum_wasm_fuel_per_block),
+                maximum_evm_fuel_per_block: maximum_evm_fuel_per_block
+                    .unwrap_or(existing_policy.maximum_evm_fuel_per_block),
+                maximum_service_oracle_execution_ms: maximum_service_oracle_execution_ms
+                    .unwrap_or(existing_policy.maximum_service_oracle_execution_ms),
+                maximum_block_size: maximum_block_size
+                    .unwrap_or(existing_policy.maximum_block_size),
+                maximum_bytecode_size: maximum_bytecode_size
+                    .unwrap_or(existing_policy.maximum_bytecode_size),
+                maximum_blob_size: maximum_blob_size.unwrap_or(existing_policy.maximum_blob_size),
+                maximum_published_blobs: maximum_published_blobs
+                    .unwrap_or(existing_policy.maximum_published_blobs),
+                maximum_block_proposal_size: maximum_block_proposal_size
+                    .unwrap_or(existing_policy.maximum_block_proposal_size),
+                maximum_bytes_read_per_block: maximum_bytes_read_per_block
+                    .unwrap_or(existing_policy.maximum_bytes_read_per_block),
+                maximum_bytes_written_per_block: maximum_bytes_written_per_block
+                    .unwrap_or(existing_policy.maximum_bytes_written_per_block),
+                maximum_oracle_response_bytes: maximum_oracle_response_bytes
+                    .unwrap_or(existing_policy.maximum_oracle_response_bytes),
+                maximum_http_response_bytes: maximum_http_response_bytes
+                    .unwrap_or(existing_policy.maximum_http_response_bytes),
+                http_request_timeout_ms: http_request_timeout_ms
+                    .unwrap_or(existing_policy.http_request_timeout_ms),
+                http_request_allow_list: http_request_allow_list
+                    .as_ref()
+                    .map(|list| list.iter().cloned().collect())
+                    .unwrap_or(existing_policy.http_request_allow_list),
             };
             let timestamp = start_timestamp
                 .map(|st| {
@@ -1540,7 +1871,29 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
                     Timestamp::from(micros)
                 })
                 .unwrap_or_else(Timestamp::now);
-            let admin_id = ChainId::root(*admin_root);
+
+            let origin: ChainOrigin = ChainOrigin::Root(*admin_root);
+            let mut signer = options.create_keystore(*testing_prng_seed)?;
+            let admin_public_key = signer.mutate(|s| s.generate_new()).await?;
+            let committee = committee_config.clone().into_committee(policy.clone());
+            let committees = [(
+                Epoch::ZERO,
+                bcs::to_bytes(&committee).expect("serializing a committee should not fail"),
+            )]
+            .into_iter()
+            .collect();
+            let admin_config = InitialChainConfig {
+                admin_id: None,
+                balance: *initial_funding,
+                committees,
+                epoch: Epoch::ZERO,
+                application_permissions: Default::default(),
+                ownership: ChainOwnership::single(admin_public_key.into()),
+            };
+            let admin_chain_description =
+                ChainDescription::new(origin, admin_config.clone(), timestamp);
+            let admin_id = admin_chain_description.id();
+
             let network_name = network_name.clone().unwrap_or_else(|| {
                 // Default: e.g. "linera-2023-11-14T23:13:20"
                 format!("linera-{}", Utc::now().naive_utc().format("%FT%T"))
@@ -1549,21 +1902,34 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
                 genesis_config_path,
                 GenesisConfig::new(committee_config, admin_id, timestamp, policy, network_name),
             )?;
-            let mut rng = Box::<dyn CryptoRng>::from(*testing_prng_seed);
             let mut chains = vec![];
             for i in 0..=*num_other_initial_chains {
-                let description = ChainDescription::Root(i);
                 // Create keys.
-                let chain = UserChain::make_initial(&mut rng, description, timestamp);
+                let public_key = if i == 0 {
+                    admin_public_key
+                } else {
+                    signer.mutate(|s| s.generate_new()).await?
+                };
+                let origin = ChainOrigin::Root(i);
+                let config = if i == 0 {
+                    admin_config.clone()
+                } else {
+                    InitialChainConfig {
+                        admin_id: Some(admin_id),
+                        ownership: ChainOwnership::single(public_key.into()),
+                        ..admin_config.clone()
+                    }
+                };
+                let description = ChainDescription::new(origin, config, timestamp);
+                let chain = UserChain::make_initial(public_key.into(), description, timestamp);
                 // Public "genesis" state.
-                let key = chain.key_pair.as_ref().unwrap().public();
-                genesis_config.chains.push((key, *initial_funding));
+                genesis_config.chains.push((public_key, *initial_funding));
                 // Private keys.
                 chains.push(chain);
             }
             genesis_config.persist().await?;
             options
-                .create_wallet(genesis_config.into_value(), *testing_prng_seed)?
+                .create_wallet(genesis_config.into_value())?
                 .mutate(|wallet| wallet.extend(chains))
                 .await?;
             options.initialize_storage().boxed().await?;
@@ -1608,12 +1974,9 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
 
         ClientCommand::Keygen => {
             let start_time = Instant::now();
-            let mut wallet = options.wallet().await?;
-            let key_pair = wallet.generate_key_pair();
-            let owner = Owner::from(key_pair.public());
-            wallet
-                .mutate(|w| w.add_unassigned_key_pair(key_pair))
-                .await?;
+            let mut signer = options.signer().await?;
+            let public_key = signer.mutate(|s| s.generate_new()).await?;
+            let owner = AccountOwner::from(public_key);
             println!("{}", owner);
             info!("Key generated in {} ms", start_time.elapsed().as_millis());
             Ok(0)
@@ -1622,7 +1985,6 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
         ClientCommand::Net(net_command) => match net_command {
             #[cfg(feature = "kubernetes")]
             NetCommand::Up {
-                extra_wallets,
                 other_initial_chains,
                 initial_amount,
                 validators,
@@ -1633,15 +1995,14 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
                 binaries,
                 no_build,
                 docker_image_name,
-                path: _,
-                storage: _,
-                external_protocol: _,
-                with_faucet_chain,
+                build_mode,
+                with_faucet,
+                faucet_chain,
                 faucet_port,
                 faucet_amount,
+                ..
             } => {
                 net_up_utils::handle_net_up_kubernetes(
-                    *extra_wallets,
                     *other_initial_chains,
                     *initial_amount,
                     *validators,
@@ -1650,8 +2011,10 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
                     binaries,
                     *no_build,
                     docker_image_name.clone(),
-                    policy_config.into_policy(),
-                    *with_faucet_chain,
+                    build_mode.clone(),
+                    *policy_config,
+                    *with_faucet,
+                    *faucet_chain,
                     *faucet_port,
                     *faucet_amount,
                 )
@@ -1661,35 +2024,39 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
             }
 
             NetCommand::Up {
-                extra_wallets,
                 other_initial_chains,
                 initial_amount,
                 validators,
                 shards,
                 testing_prng_seed,
                 policy_config,
+                cross_chain_config,
                 path,
-                storage,
                 external_protocol,
-                with_faucet_chain,
+                with_faucet,
+                faucet_chain,
                 faucet_port,
                 faucet_amount,
+                block_exporters,
                 ..
             } => {
                 net_up_utils::handle_net_up_service(
-                    *extra_wallets,
                     *other_initial_chains,
                     *initial_amount,
                     *validators,
                     *shards,
                     *testing_prng_seed,
-                    policy_config.into_policy(),
+                    *policy_config,
+                    cross_chain_config.clone(),
                     path,
-                    storage,
+                    // Not using the default value for storage
+                    &options.storage_config,
                     external_protocol.clone(),
-                    *with_faucet_chain,
+                    *with_faucet,
+                    *faucet_chain,
                     *faucet_port,
                     *faucet_amount,
+                    *block_exporters,
                 )
                 .boxed()
                 .await?;
@@ -1699,7 +2066,7 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
             NetCommand::Helper => {
                 info!("You may append the following script to your `~/.bash_profile` or `source` it when needed.");
                 info!(
-                    "This will install a function `linera_spawn_and_read_wallet_variables` to facilitate \
+                    "This will install several functions to facilitate \
                        testing with a local Linera network"
                 );
                 println!("{}", include_str!("../../template/linera_net_helper.sh"));
@@ -1708,70 +2075,7 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
         },
 
         ClientCommand::Storage(command) => {
-            let storage_config = command.storage_config()?;
-            let common_config = CommonStoreConfig::default();
-            let full_storage_config = storage_config.add_common_config(common_config).await?;
-            let start_time = Instant::now();
-            match command {
-                DatabaseToolCommand::DeleteAll { .. } => {
-                    full_storage_config.delete_all().await?;
-                    info!(
-                        "All namespaces deleted in {} ms",
-                        start_time.elapsed().as_millis()
-                    );
-                }
-                DatabaseToolCommand::DeleteNamespace { .. } => {
-                    full_storage_config.delete_namespace().await?;
-                    info!(
-                        "Namespace deleted in {} ms",
-                        start_time.elapsed().as_millis()
-                    );
-                }
-                DatabaseToolCommand::CheckExistence { .. } => {
-                    let test = full_storage_config.test_existence().await?;
-                    info!(
-                        "Existence of a namespace checked in {} ms",
-                        start_time.elapsed().as_millis()
-                    );
-                    if test {
-                        println!("The database does exist");
-                        return Ok(0);
-                    } else {
-                        println!("The database does not exist");
-                        return Ok(1);
-                    }
-                }
-                DatabaseToolCommand::CheckAbsence { .. } => {
-                    let test = full_storage_config.test_existence().await?;
-                    info!(
-                        "Absence of a namespace checked in {} ms",
-                        start_time.elapsed().as_millis()
-                    );
-                    if test {
-                        println!("The database does exist");
-                        return Ok(1);
-                    } else {
-                        println!("The database does not exist");
-                        return Ok(0);
-                    }
-                }
-                DatabaseToolCommand::Initialize { .. } => {
-                    full_storage_config.initialize().await?;
-                    info!(
-                        "Initialization done in {} ms",
-                        start_time.elapsed().as_millis()
-                    );
-                }
-                DatabaseToolCommand::ListNamespaces { .. } => {
-                    let namespaces = full_storage_config.list_all().await?;
-                    info!(
-                        "Namespaces listed in {} ms",
-                        start_time.elapsed().as_millis()
-                    );
-                    println!("The list of namespaces is {:?}", namespaces);
-                }
-            }
-            Ok(0)
+            Ok(options.run_with_store(DatabaseToolJob(command)).await?)
         }
 
         ClientCommand::Wallet(wallet_command) => match wallet_command {
@@ -1794,7 +2098,12 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
                         println!("{chain_id}");
                     }
                 } else {
-                    wallet::pretty_print(&*options.wallet().await?, chain_ids);
+                    wallet::pretty_print(
+                        &*options.wallet().await?,
+                        options.signer().await?.deref(),
+                        chain_ids,
+                    )
+                    .await;
                 }
                 info!("Wallet shown in {} ms", start_time.elapsed().as_millis());
                 Ok(0)
@@ -1816,13 +2125,38 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
 
             WalletCommand::ForgetKeys { chain_id } => {
                 let start_time = Instant::now();
-                options
+                let owner = options
                     .wallet()
                     .await?
                     .mutate(|w| w.forget_keys(chain_id))
                     .await??;
+                if !options
+                    .signer()
+                    .await?
+                    .contains_key(&owner)
+                    .await
+                    .expect("Signer error")
+                {
+                    warn!("no keypair found in keystore for chain {chain_id}");
+                }
                 info!(
                     "Chain keys forgotten in {} ms",
+                    start_time.elapsed().as_millis()
+                );
+                Ok(0)
+            }
+
+            WalletCommand::FollowChain { chain_id } => {
+                let start_time = Instant::now();
+                options
+                    .wallet()
+                    .await?
+                    .mutate(|wallet| {
+                        wallet.extend([UserChain::make_other(*chain_id, Timestamp::now())])
+                    })
+                    .await?;
+                info!(
+                    "Chain followed and added in {} ms",
                     start_time.elapsed().as_millis()
                 );
                 Ok(0)
@@ -1836,6 +2170,11 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
                     .mutate(|w| w.forget_chain(chain_id))
                     .await??;
                 info!("Chain forgotten in {} ms", start_time.elapsed().as_millis());
+                Ok(0)
+            }
+
+            WalletCommand::RequestChain { .. } => {
+                options.run_with_storage(Job(options.clone())).await??;
                 Ok(0)
             }
 
@@ -1877,8 +2216,10 @@ Make sure to use a Linera client compatible with this network.
                     (_, _) => bail!("Either --faucet or --genesis must be specified, but not both"),
                 };
                 let timestamp = genesis_config.timestamp;
+                let mut keystore = options.create_keystore(*testing_prng_seed)?;
+                keystore.persist().await?;
                 options
-                    .create_wallet(genesis_config, *testing_prng_seed)?
+                    .create_wallet(genesis_config)?
                     .mutate(|wallet| {
                         wallet.extend(
                             with_other_chains

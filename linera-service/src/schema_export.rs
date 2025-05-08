@@ -3,9 +3,9 @@
 
 use async_trait::async_trait;
 use linera_base::{
-    crypto::{CryptoHash, KeyPair},
+    crypto::CryptoHash,
     data_types::{BlobContent, Timestamp},
-    identifiers::{BlobId, ChainId},
+    identifiers::{AccountOwner, BlobId, ChainId},
 };
 use linera_chain::{
     data_types::BlockProposal,
@@ -27,11 +27,12 @@ use linera_core::{
         ValidatorNodeProvider,
     },
 };
-use linera_execution::committee::{Committee, ValidatorName};
+use linera_execution::committee::Committee;
+use linera_sdk::linera_base_types::ValidatorPublicKey;
 use linera_service::node_service::NodeService;
-use linera_storage::{DbStorage, Storage};
+use linera_storage::{DbStorage, NetworkDescription, Storage};
 use linera_version::VersionInfo;
-use linera_views::memory::{MemoryStore, MemoryStoreConfig, TEST_MEMORY_MAX_STREAM_QUERIES};
+use linera_views::memory::MemoryStore;
 
 #[derive(Clone)]
 struct DummyValidatorNode;
@@ -103,7 +104,7 @@ impl ValidatorNode for DummyValidatorNode {
         Err(NodeError::UnexpectedMessage)
     }
 
-    async fn get_genesis_config_hash(&self) -> Result<CryptoHash, NodeError> {
+    async fn get_network_description(&self) -> Result<NetworkDescription, NodeError> {
         Err(NodeError::UnexpectedMessage)
     }
 
@@ -150,7 +151,7 @@ impl ValidatorNodeProvider for DummyValidatorNodeProvider {
     fn make_nodes(
         &self,
         _committee: &Committee,
-    ) -> Result<impl Iterator<Item = (ValidatorName, Self::Node)> + '_, NodeError> {
+    ) -> Result<impl Iterator<Item = (ValidatorPublicKey, Self::Node)> + '_, NodeError> {
         Err::<std::iter::Empty<_>, _>(NodeError::UnexpectedMessage)
     }
 }
@@ -171,33 +172,38 @@ struct DummyContext<P, S> {
 impl<P: ValidatorNodeProvider + Send, S: Storage + Clone + Send + Sync + 'static> ClientContext
     for DummyContext<P, S>
 {
-    type ValidatorNodeProvider = P;
-    type Storage = S;
+    type Environment = linera_core::environment::Impl<S, P>;
 
     fn wallet(&self) -> &Wallet {
         unimplemented!()
     }
 
-    fn make_chain_client(&self, _: ChainId) -> Result<ChainClient<P, S>, Error> {
+    fn storage(&self) -> &S {
+        unimplemented!()
+    }
+
+    fn client(&self) -> &linera_core::client::Client<Self::Environment> {
+        unimplemented!()
+    }
+
+    async fn make_chain_client(&self, _: ChainId) -> Result<ChainClient<Self::Environment>, Error> {
         unimplemented!()
     }
 
     async fn update_wallet_for_new_chain(
         &mut self,
         _: ChainId,
-        _: Option<KeyPair>,
+        _: Option<AccountOwner>,
         _: Timestamp,
     ) -> Result<(), Error> {
         Ok(())
     }
 
-    async fn update_wallet(&mut self, _: &ChainClient<P, S>) -> Result<(), Error> {
+    async fn update_wallet(&mut self, _: &ChainClient<Self::Environment>) -> Result<(), Error> {
         Ok(())
     }
 
-    fn clients(
-        &self,
-    ) -> Result<Vec<ChainClient<Self::ValidatorNodeProvider, Self::Storage>>, Error> {
+    async fn clients(&self) -> Result<Vec<ChainClient<Self::Environment>>, Error> {
         Ok(vec![])
     }
 }
@@ -206,21 +212,14 @@ impl<P: ValidatorNodeProvider + Send, S: Storage + Clone + Send + Sync + 'static
 async fn main() -> std::io::Result<()> {
     let _options = <Options as clap::Parser>::parse();
 
-    let store_config = MemoryStoreConfig::new(TEST_MEMORY_MAX_STREAM_QUERIES);
-    let namespace = "schema_export";
-    let root_key = &[];
-    let storage = DbStorage::<MemoryStore, _>::initialize(store_config, namespace, root_key, None)
-        .await
-        .expect("storage");
     let config = ChainListenerConfig::default();
-    let context = DummyContext::<DummyValidatorNodeProvider, _> {
+    let context = DummyContext::<DummyValidatorNodeProvider, DbStorage<MemoryStore>> {
         _phantom: std::marker::PhantomData,
     };
     let service = NodeService::new(
         config,
         std::num::NonZeroU16::new(8080).unwrap(),
         None,
-        storage,
         context,
     )
     .await;

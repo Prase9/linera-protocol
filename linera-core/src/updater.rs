@@ -3,9 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     hash::Hash,
+    mem,
     ops::Range,
 };
 
@@ -42,10 +43,10 @@ const MAX_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 24); // 1 day.
 pub enum CommunicateAction {
     SubmitBlock {
         proposal: Box<BlockProposal>,
-        blob_ids: HashSet<BlobId>,
+        blob_ids: Vec<BlobId>,
     },
     FinalizeBlock {
-        certificate: ValidatedBlockCertificate,
+        certificate: Box<ValidatedBlockCertificate>,
         delivery: CrossChainMessageDelivery,
     },
     RequestTimeout {
@@ -119,14 +120,14 @@ where
     let mut responses: futures::stream::FuturesUnordered<_> = validator_clients
         .iter()
         .filter_map(|remote_node| {
-            if committee.weight(&remote_node.name) == 0 {
+            if committee.weight(&remote_node.public_key) == 0 {
                 // This should not happen but better prevent it because certificates
                 // are not allowed to include votes with weight 0.
                 return None;
             }
             let execute = execute.clone();
             let remote_node = remote_node.clone();
-            Some(async move { (remote_node.name, execute(remote_node).await) })
+            Some(async move { (remote_node.public_key, execute(remote_node).await) })
         })
         .collect();
 
@@ -253,11 +254,11 @@ where
                 self.remote_node
                     .check_blobs_not_found(&certificate, blob_ids)?;
                 let chain_id = certificate.inner().chain_id();
-                // The certificate is for a validated block, i.e. for our locked block.
+                // The certificate is for a validated block, i.e. for our locking block.
                 // Take the missing blobs from our local chain manager.
                 let blobs = self
                     .local_node
-                    .get_locked_blobs(blob_ids, chain_id)
+                    .get_locking_blobs(blob_ids, chain_id)
                     .await?
                     .ok_or_else(|| original_err.clone())?;
                 self.remote_node.send_pending_blobs(chain_id, blobs).await?;
@@ -272,13 +273,10 @@ where
     async fn send_block_proposal(
         &mut self,
         proposal: Box<BlockProposal>,
-        mut blob_ids: HashSet<BlobId>,
+        mut blob_ids: Vec<BlobId>,
     ) -> Result<Box<ChainInfo>, ChainClientError> {
-        let chain_id = proposal.content.proposal.chain_id;
+        let chain_id = proposal.content.block.chain_id;
         let mut sent_cross_chain_updates = false;
-        for blob in &proposal.blobs {
-            blob_ids.remove(&blob.id()); // Keep only blobs we may need to resend.
-        }
         loop {
             match self
                 .remote_node
@@ -300,8 +298,25 @@ where
                     // For `BlobsNotFound`, we assume that the local node should already be
                     // updated with the needed blobs, so sending the chain information about the
                     // certificates that last used the blobs to the validator node should be enough.
-                    let blob_ids = blob_ids.drain().collect::<Vec<_>>();
-                    let missing_blob_ids = self.remote_node.node.missing_blob_ids(blob_ids).await?;
+                    let published_blob_ids =
+                        BTreeSet::from_iter(proposal.content.block.published_blob_ids());
+                    blob_ids.retain(|blob_id| !published_blob_ids.contains(blob_id));
+                    let mut published_blobs = Vec::new();
+                    {
+                        let chain = self.local_node.chain_state_view(chain_id).await?;
+                        for blob_id in published_blob_ids {
+                            published_blobs
+                                .extend(chain.manager.proposed_blobs.get(&blob_id).await?);
+                        }
+                    }
+                    self.remote_node
+                        .send_pending_blobs(chain_id, published_blobs)
+                        .await?;
+                    let missing_blob_ids = self
+                        .remote_node
+                        .node
+                        .missing_blob_ids(mem::take(&mut blob_ids))
+                        .await?;
                     let local_storage = self.local_node.storage_client();
                     let blob_states = local_storage.read_blob_states(&missing_blob_ids).await?;
                     let mut chain_heights = BTreeMap::new();
@@ -355,7 +370,7 @@ where
             }
         }
         if let Some(cert) = timeout {
-            if cert.inner().chain_id == chain_id {
+            if cert.value().chain_id() == chain_id {
                 // Timeouts are small and don't have blobs, so we can call `handle_certificate`
                 // directly.
                 self.remote_node.handle_timeout_certificate(cert).await?;
@@ -394,7 +409,7 @@ where
             for (origin, inbox) in pairs {
                 let inbox_next_height = inbox.next_block_height_to_receive()?;
                 sender_heights
-                    .entry(origin.sender)
+                    .entry(origin)
                     .and_modify(|h| *h = inbox_next_height.max(*h))
                     .or_insert(inbox_next_height);
             }
@@ -411,7 +426,7 @@ where
     ) -> Result<LiteVote, ChainClientError> {
         let (target_block_height, chain_id) = match &action {
             CommunicateAction::SubmitBlock { proposal, .. } => {
-                let block = &proposal.content.proposal;
+                let block = &proposal.content.block;
                 (block.height, block.chain_id)
             }
             CommunicateAction::FinalizeBlock { certificate, .. } => (
@@ -437,7 +452,7 @@ where
                 delivery,
             } => {
                 let info = self
-                    .send_validated_certificate(certificate, delivery)
+                    .send_validated_certificate(*certificate, delivery)
                     .await?;
                 info.manager.pending
             }
@@ -448,7 +463,7 @@ where
             }
         };
         match vote {
-            Some(vote) if vote.validator == self.remote_node.name => {
+            Some(vote) if vote.public_key == self.remote_node.public_key => {
                 vote.check()?;
                 Ok(vote)
             }
